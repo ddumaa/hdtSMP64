@@ -1,6 +1,102 @@
 #include "dhdtPapyrusFunctions.h"
 #include "dhdtOverrideManager.h"
 #include "hdtSkyrimPhysicsWorld.h"
+#include <cmath>
+
+namespace
+{
+	struct LiveGTSystem
+	{
+		RE::BSTSmartPointer<hdt::SkyrimSystem> system;
+		std::string path;
+	};
+
+	// Call with the actor manager lock held. Follow the manager's third-person
+	// skeleton selection and reject ambiguity rather than patching another mesh.
+	LiveGTSystem findLiveGTSystem(hdt::ActorManager& manager, const RE::Actor* actor, RE::FormID addon)
+	{
+		LiveGTSystem result;
+		for (auto& skeleton : manager.getSkeletons()) {
+			if (!skeleton.skeleton || skeleton.skeletonOwner.get() != actor ||
+			    hdt::isFirstPersonSkeleton(skeleton.skeleton.get()))
+				continue;
+			for (auto& armor : skeleton.getArmors()) {
+				if (!armor.armorWorn || !armor.hasPhysics() ||
+				    hdt::util::splitArmorAddonFormID(armor.armorWorn->name.c_str()) != addon)
+					continue;
+				if (result.system)
+					return {};
+				result = { armor.m_physics, armor.physicsFile.first };
+			}
+		}
+		return result;
+	}
+
+	int shapePhysicsLiveVersion(RE::StaticFunctionTag*)
+	{
+		return 1;
+	}
+
+	RE::BSFixedString getTargetGT(RE::StaticFunctionTag*, RE::Actor* actor, RE::TESObjectARMA* addon)
+	{
+		if (!actor || !addon)
+			return "";
+		auto& manager = *hdt::ActorManager::instance();
+		auto guard = manager.lockGuard();
+		auto current = findLiveGTSystem(manager, actor, addon->formID);
+		if (!current.system)
+			return "";
+		auto simulation = hdt::SkyrimPhysicsWorld::get()->lockSimulation();
+		return current.system->liveGTTarget().c_str();
+	}
+
+	bool blendGT(RE::StaticFunctionTag*, RE::Actor* actor, RE::TESObjectARMA* addon,
+		RE::BSFixedString targetXml, float seconds)
+	{
+		if (!actor || !addon || !std::isfinite(seconds) || seconds < 0.05f || seconds > 5.f)
+			return false;
+		const std::string target(targetXml.c_str());
+		const auto family = hdt::SkyrimSystemCreator::liveGTProfileFamily(target);
+		if (family.empty())
+			return false;
+
+		auto& manager = *hdt::ActorManager::instance();
+		auto& world = *hdt::SkyrimPhysicsWorld::get();
+		LiveGTSystem original;
+		std::string previous;
+		{
+			auto guard = manager.lockGuard();
+			original = findLiveGTSystem(manager, actor, addon->formID);
+			if (!original.system || hdt::SkyrimSystemCreator::liveGTProfileFamily(original.path) != family)
+				return false;
+			auto simulation = world.lockSimulation();
+			previous = original.system->liveGTTarget();
+			if (previous == target)
+				return true;
+		}
+
+		// The XML is only a coefficient source. No model or Bullet object is
+		// created by this parser, and it runs outside the simulation lock.
+		auto profile = hdt::SkyrimSystemCreator().readLiveGTProfile(target);
+		if (!profile) {
+			logger::warn("[ShapePhysicsLive] Could not read GT spring target {}", target);
+			return false;
+		}
+
+		auto guard = manager.lockGuard();
+		auto current = findLiveGTSystem(manager, actor, addon->formID);
+		if (current.system.get() != original.system.get() || current.path != original.path)
+			return false;
+		auto simulation = world.lockSimulation();
+		if (current.system->liveGTTarget() != previous)
+			return current.system->liveGTTarget() == target;
+		if (!current.system->blendGTSprings(*profile, target, seconds)) {
+			logger::warn("[ShapePhysicsLive] Rejected GT spring target {} for the attached system", target);
+			return false;
+		}
+		return true;
+	}
+}
 
 bool RegisterFuncs(RE::BSScript::IVirtualMachine* registry)
 {
@@ -10,6 +106,9 @@ bool RegisterFuncs(RE::BSScript::IVirtualMachine* registry)
 	registry->RegisterFunction("QueryCurrentPhysicsFile", "DynamicHDT", hdt::papyrus::QueryCurrentPhysicsFile);
 	registry->RegisterFunction("TogglePhysics", "DynamicHDT", hdt::papyrus::TogglePhysics);
 	registry->RegisterFunction("ResetPhysics", "DynamicHDT", hdt::papyrus::ResetPhysics);
+	registry->RegisterFunction("GetVersion", "ShapePhysicsLive", shapePhysicsLiveVersion);
+	registry->RegisterFunction("GetTargetGT", "ShapePhysicsLive", getTargetGT);
+	registry->RegisterFunction("BlendGT", "ShapePhysicsLive", blendGT);
 	//
 	return true;
 }

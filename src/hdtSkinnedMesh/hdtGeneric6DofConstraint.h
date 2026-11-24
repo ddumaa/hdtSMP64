@@ -16,7 +16,11 @@ namespace hdt
 		virtual ~Generic6DofConstraint() override = default;
 
 		void scaleConstraint() override;
+		float linearStiffnessScale() const { return m_linearStiffnessScale; }
+		float angularStiffnessScale() const { return m_angularStiffnessScale; }
 
 	private:
+		float m_linearStiffnessScale = 1.f;
+		float m_angularStiffnessScale = 1.f;
 	};
 }

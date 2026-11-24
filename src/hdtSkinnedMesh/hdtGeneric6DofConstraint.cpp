@@ -42,6 +42,8 @@ namespace hdt
 		m_linearLimits.m_equilibriumPoint *= factor;
 		// target k = ma / x(kg/s^2)
 		m_linearLimits.m_springStiffness *= factor3;
+		m_linearStiffnessScale *= factor3;
+		m_angularStiffnessScale *= factor5;
 		m_linearLimits.m_upperLimit *= factor;
 		m_linearLimits.m_lowerLimit *= factor;
 		for (int i = 0; i < 3; ++i) {

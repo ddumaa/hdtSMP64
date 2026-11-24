@@ -8,6 +8,8 @@
 
 namespace hdt
 {
+	bool isFirstPersonSkeleton(RE::NiNode* skeleton);
+
 	class ActorManager :
 		public RE::BSTEventSink<Events::ArmorAttachEvent>,
 		public RE::BSTEventSink<Events::ArmorDetachEvent>,

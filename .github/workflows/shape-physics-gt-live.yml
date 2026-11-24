@@ -1,0 +1,87 @@
+name: Shape Physics GT Live SMP QA
+
+on:
+  push:
+    branches:
+      - qa/shape-physics-gt-live
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: shape-physics-gt-live-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 60
+    env:
+      BUILD_INFO: shape-physics-gt-live-${{ github.sha }}
+
+    steps:
+      - name: Check out FSMP and its submodules
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Cache vcpkg archives
+        uses: actions/cache@v4
+        with:
+          path: ~\AppData\Local\vcpkg\archives
+          key: vcpkg-windows-2022-fsmp-avx-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json', 'cmake/ports/**', 'cmake/triplets/**') }}
+
+      - name: Configure FSMP
+        shell: pwsh
+        run: |
+          $binaryCache = Join-Path $env:LOCALAPPDATA 'vcpkg\archives'
+          New-Item -ItemType Directory -Force -Path $binaryCache | Out-Null
+          $env:VCPKG_BINARY_SOURCES = "clear;files,$binaryCache,readwrite"
+
+          $pluginRoot = Join-Path $env:GITHUB_WORKSPACE 'out/build/vs2022-windows-avx/plugins'
+          New-Item -ItemType Directory -Force -Path (Join-Path $pluginRoot 'SKSE/Plugins') | Out-Null
+          cmake --preset vs2022-windows-avx `
+            "-DCMAKE_TOOLCHAIN_FILE=$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake" `
+            -DVCPKG_MANIFEST_MODE=ON `
+            "-DCompiledPluginsPath=$pluginRoot" `
+            "-DPROJECT_BUILD_INFO=$env:BUILD_INFO" `
+            -DBUILD_VALIDATOR_TESTS=ON
+
+      - name: Build the AVX DLL
+        run: cmake --build out/build/vs2022-windows-avx --config Release
+
+      - name: Run FSMP validator tests
+        run: ctest --test-dir out/build/vs2022-windows-avx -C Release --output-on-failure --no-tests=error
+
+      - name: Verify and stage the QA artifact
+        shell: pwsh
+        run: |
+          $dll = (Resolve-Path -LiteralPath 'out/build/vs2022-windows-avx/plugins/SKSE/Plugins/hdtsmp64.dll').Path
+          $version = [System.Diagnostics.FileVersionInfo]::GetVersionInfo($dll)
+          if ($version.FileVersion -ne '4.1.1.0' -or $version.ProductVersion -notmatch '\(avx\)') {
+              throw "Unexpected DLL version: $($version.ProductVersion)"
+          }
+          $binary = [System.Text.Encoding]::ASCII.GetString([System.IO.File]::ReadAllBytes($dll))
+          foreach ($marker in $env:BUILD_INFO, 'ShapePhysicsLive', 'GetTargetGT', 'BlendGT') {
+              if (-not $binary.Contains($marker)) {
+                  throw "Missing marker in the QA DLL: $marker"
+              }
+          }
+
+          $relativeDll = 'SKSE/Plugins/hdtsmp64.dll'
+          $destination = Join-Path 'artifacts' $relativeDll
+          New-Item -ItemType Directory -Force -Path (Split-Path -Parent $destination) | Out-Null
+          Copy-Item -LiteralPath $dll -Destination $destination
+          Copy-Item -LiteralPath 'LICENSE', 'EXCEPTIONS' -Destination 'artifacts'
+          $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $destination).Hash.ToLowerInvariant()
+          "$hash  $relativeDll" | Set-Content -Encoding ascii -LiteralPath 'artifacts/SHA256SUMS.txt'
+          $env:GITHUB_SHA | Set-Content -Encoding ascii -LiteralPath 'artifacts/BUILD-COMMIT.txt'
+
+      - name: Upload the QA DLL and build metadata
+        uses: actions/upload-artifact@v4
+        with:
+          name: fsmp-4.1.1-avx-shape-physics-gt-live-${{ github.sha }}
+          path: artifacts/
+          if-no-files-found: error
