@@ -1,0 +1,491 @@
+diff --git a/Scripts/Source/ShapePhysicsUnified.psc b/Scripts/Source/ShapePhysicsUnified.psc
+--- a/Scripts/Source/ShapePhysicsUnified.psc
++++ b/Scripts/Source/ShapePhysicsUnified.psc
+@@ -32,6 +32,8 @@
+ int nearbyIndex
+ int cleanupIndex
+ bool updateRunning
++bool oBodyRefreshScheduled
++string oBodyRefreshQueue = "ShapePhysicsUnified.OBodyRefresh"
+ int npcRefreshGeneration = 1
+ bool hasPapyrusUtil
+ bool hasJContainers
+@@ -42,6 +44,12 @@
+ bool hasGTSoftbody
+ bool hasFSMP
+ bool hasDynamicHDT
++bool hasLiveSMP
++string playerGTLiveTarget = ""
++string playerGTLiveAuxTarget = ""
++string rejectedGTLiveTarget
++string player3BALiveTarget = ""
++string rejected3BALiveTarget
+ bool hasCBPCPlugin
+ bool hasOStim
+ bool hasRegionalSMPComposer
+@@ -67,6 +75,9 @@
+     string regionalFolder = luaRoot + "shaperegionalsmp/"
+     string templates = regionalFolder + "templates/"
+     hasDynamicHDT = hasPapyrusUtil && hasFSMP && MiscUtil.FileExists("Data/Scripts/DynamicHDT.pex")
++    ; The marker travels with the QA DLL. The script overlay alone stays inactive.
++    hasLiveSMP = hasDynamicHDT && MiscUtil.FileExists("Data/SKSE/Plugins/ShapePhysicsLiveGTQA.ini") \
++        && ShapePhysicsLive.GetVersion() == 3
+     hasRegionalSMPComposer = hasPapyrusUtil && MiscUtil.FileExists(regionalFolder + "compose.lua") \
+         && MiscUtil.FileExists(regionalFolder + "manifest.lua")
+     has3BAGeometry = hasPapyrusUtil && MiscUtil.FileExists(luaRoot + "shapeunified3ba/geometry.lua")
+@@ -110,6 +121,7 @@
+         endif
+     endif
+     LoadMenuLanguage()
++    RegisterOBodyRefresh()
+     RegisterForSingleUpdate(3.0)
+ EndEvent
+ 
+@@ -124,7 +136,17 @@
+     nearbyIndex = nearbyActors.Length
+     cleanupIndex = 0
+     updateRunning = false
++    oBodyRefreshScheduled = false
++    if hasPapyrusUtil
++        StorageUtil.FormListClear(self, oBodyRefreshQueue)
++    endif
++    RegisterOBodyRefresh()
+     playerScoreSource = ""
++    playerGTLiveTarget = ""
++    playerGTLiveAuxTarget = ""
++    rejectedGTLiveTarget = ""
++    player3BALiveTarget = ""
++    rejected3BALiveTarget = ""
+     npcRefreshGeneration += 1
+     LoadMenuLanguage()
+     if hasPapyrusUtil
+@@ -158,8 +180,59 @@
+     registeredMenuTitle = ModName
+ EndEvent
+ 
++Function RegisterOBodyRefresh()
++    if hasOBody
++        RegisterForModEvent("Obody_ApplyMorph", "OnOBodyMorphApplied")
++    else
++        UnregisterForModEvent("Obody_ApplyMorph")
++    endif
++EndFunction
++
++Event OnOBodyMorphApplied(string eventName, string strArg, float numArg, Form sender)
++    Actor target = sender as Actor
++    if strArg != "ApplyMorphs" || !target || !RuntimeDependenciesReady() || !IsEnabled()
++        return
++    endif
++    if target != Game.GetPlayer() && !adaptNPCs
++        return
++    endif
++
++    StorageUtil.FormListAdd(self, oBodyRefreshQueue, target, false)
++    if oBodyRefreshScheduled
++        return
++    endif
++    oBodyRefreshScheduled = true
++    ; Wait in game time so the picker can close and OBody can finish its equipment refresh.
++    Utility.Wait(0.15)
++    oBodyRefreshScheduled = false
++    if !updateRunning && !Utility.IsInMenuMode()
++        updateRunning = true
++        RefreshOBodyActors(Game.GetPlayer())
++        updateRunning = false
++    endif
++EndEvent
++
++Function RefreshOBodyActors(Actor player)
++    int remaining = StorageUtil.FormListCount(self, oBodyRefreshQueue)
++    while remaining > 0 && !oBodyRefreshScheduled
++        Actor target = StorageUtil.FormListGet(self, oBodyRefreshQueue, 0) as Actor
++        StorageUtil.FormListRemoveAt(self, oBodyRefreshQueue, 0)
++        if target && IsEnabled() && target.Is3DLoaded() && !target.IsDead()
++            if target == player
++                Debug.Trace("[ShapePhysicsUnified] OBody morph refresh for player")
++                EvaluateActor(target)
++            elseif adaptNPCs && ((sceneActors && sceneActors.Find(target) >= 0) \
++                || (HasNPCScanner() && target.GetDistance(player) <= 1400.0))
++                EvaluateActor(target)
++            endif
++        endif
++        remaining -= 1
++    endwhile
++EndFunction
++
+ Event OnUpdate()
+     if updateRunning
++        RegisterForSingleUpdate(3.0)
+         return
+     endif
+     updateRunning = true
+@@ -182,6 +255,7 @@
+         endwhile
+         UpdateNearbyActors(player)
+         CleanupTrackedActors()
++        RefreshOBodyActors(player)
+     endif
+     updateRunning = false
+     RegisterForSingleUpdate(3.0)
+@@ -269,6 +343,9 @@
+     endif
+     if target == Game.GetPlayer()
+         regionalProfileActive = false
++        playerGTLiveTarget = ""
++        playerGTLiveAuxTarget = ""
++        player3BALiveTarget = ""
+         player3BAMode = 0
+     endif
+     if !target || !target.Is3DLoaded() || target.IsDead()
+@@ -529,8 +606,10 @@
+     if fullOutfit
+         expected = ShapeUnified3BA.FullOutfitXML(expected)
+     endif
++    bool live = hasLiveSMP && target == Game.GetPlayer()
++    bool regional = RegionalSelection(target, 1, sample)
+     bool regionalLower = false
+-    if RegionalSelection(target, 1, sample)
++    if regional
+         string baseline = stock
+         if fullOutfit
+             baseline = ShapeUnified3BA.FullOutfitXML(stock)
+@@ -540,7 +619,7 @@
+         float abdomen = CBPCRegionFactor(sample, 3, manager.BellySMP || gtLower)
+         float thighs = CBPCRegionFactor(sample, 4, manager.ThighSMP || gtLower)
+         if target.GetWornForm(4) == torso && target.IsEquipped(controller)
+-            regionalLower = Update3BAGTAuxiliary(target, sample, gtLower)
++            regionalLower = Update3BAGTAuxiliary(target, sample, gtLower, live)
+             bool regionalCBPC = ApplyRegionalCBPC(target, torso, -1.0, glutes, abdomen, thighs)
+             regionalLower = regionalLower || regionalCBPC
+         else
+@@ -551,11 +630,17 @@
+         UpdateGTAuxiliary(target, 0)
+         RestoreCBPC(target)
+     endif
+-    if current != expected && target.GetWornForm(4) == torso && target.IsEquipped(controller)
+-        bool loaded = DynamicHDT.ReloadPhysicsFile(target, addon, expected, false)
+-        current = DynamicHDT.QueryCurrentPhysicsFile(target, addon)
+-        if !loaded && current != expected && target.IsEquipped(controller)
+-            ShapeRegionalSMP.Reject(expected)
++    if target.GetWornForm(4) == torso && target.IsEquipped(controller)
++        if live && regional && TryEvaluateLive3BA(target, addon, current, expected, group, index)
++            RecordZonePhysics(target, torso, 2, manager, current, gtLower)
++            return
++        endif
++        if current != expected
++            bool loaded = DynamicHDT.ReloadPhysicsFile(target, addon, expected, false)
++            current = DynamicHDT.QueryCurrentPhysicsFile(target, addon)
++            if !loaded && current != expected && target.IsEquipped(controller)
++                ShapeRegionalSMP.Reject(expected)
++            endif
+         endif
+     endif
+     if current == expected
+@@ -570,6 +655,53 @@
+         ReportActor(target, "$S3BA_WaitXML", current, ReportedGroup(group), index)
+     endif
+     RecordZonePhysics(target, torso, 2, manager, current, gtLower)
++EndFunction
++
++Bool Function TryEvaluateLive3BA(Actor target, ArmorAddon addon, string current, string expected, int group, float index)
++    string family = ThreeBALiveFamily(current)
++    if family == "" || family != ThreeBALiveFamily(expected)
++        return false
++    endif
++
++    string accepted = ShapePhysicsLive.GetTarget3BA(target, addon)
++    if current == expected && accepted == ""
++        return false
++    endif
++    if accepted != expected && ShapePhysicsLive.Blend3BA(target, addon, expected, 0.5)
++        accepted = expected
++        Debug.Trace("[ShapePhysicsLive3BAQA] body target=" + expected + " base=" + current)
++    endif
++
++    string status = "$S3BA_SMP"
++    if accepted == expected
++        rejected3BALiveTarget = ""
++    else
++        status = "3BA SMP QA (target rejected)"
++        if rejected3BALiveTarget != expected
++            rejected3BALiveTarget = expected
++            Debug.Trace("[ShapePhysicsLive3BAQA] body target rejected=" + expected + " base=" + current)
++        endif
++    endif
++    player3BALiveTarget = accepted
++    MarkRegionalProfile(target, true)
++    ReportActor(target, status, current, ReportedGroup(group), index)
++    return true
++EndFunction
++
++String Function ThreeBALiveFamily(string path)
++    string prefix = "SKSE\\Plugins\\hdtSkinnedMeshConfigs\\ShapePhysicsRegional\\threeba_"
++    if StringUtil.Find(path, prefix) != 0
++        return ""
++    endif
++    int nameEnd = StringUtil.Find(path, "__", StringUtil.GetLength(prefix))
++    if nameEnd < 0
++        return ""
++    endif
++    int stampEnd = StringUtil.Find(path, "__", nameEnd + 2)
++    if stampEnd != nameEnd + 14 || StringUtil.Find(path, "__3ba-smooth_q", stampEnd) != stampEnd
++        return ""
++    endif
++    return StringUtil.Substring(path, 0, stampEnd)
+ EndFunction
+ 
+ String Function Original3BAXML(string current)
+@@ -1158,12 +1290,17 @@
+     Spell customPresetMark = Game.GetFormFromFile(0x83F, gtPlugin) as Spell
+     bool excluded = (exclude && target.HasSpell(exclude)) || (customPresetMark && target.HasSpell(customPresetMark))
+     if requested && !excluded
+-        if current != stock && ReloadGT(target, torso, addon, stock, true) != stock
+-            ReportActor(target, "$S3BA_WaitXML", current)
+-            return
+-        endif
+-        current = stock
+-        managed = false
++        ; Selecting Auto again can reuse the already loaded automatic GT system.
++        bool keepLive = adaptive && hasLiveSMP && target == Game.GetPlayer() \
++            && GTLiveFamily(current) != "" && ShapeUnifiedGTWeight.StockSelectorOff()
++        if !keepLive
++            if current != stock && ReloadGT(target, torso, addon, stock, true) != stock
++                ReportActor(target, "$S3BA_WaitXML", current)
++                return
++            endif
++            current = stock
++            managed = false
++        endif
+         StorageUtil.UnsetIntValue(target, "ShapePhysicsUnified.RequestGTAuto")
+         if target == Game.GetPlayer()
+             resetGTAuto = false
+@@ -1241,6 +1378,10 @@
+     else
+         UpdateGTAuxiliary(target, 0)
+     endif
++    bool live = regional && hasLiveSMP && target == Game.GetPlayer() && !torso
++    if live && TryEvaluateLiveGT(target, addon, current, path, sample, group, index)
++        return
++    endif
+     if current != path
+         current = ReloadGT(target, torso, addon, path)
+     endif
+@@ -1248,13 +1389,83 @@
+         ShapeRegionalSMP.Confirm(current)
+         bool regionalAux = false
+         if regional
+-            regionalAux = UpdateGTAuxiliary(target, sample)
++            regionalAux = UpdateGTAuxiliary(target, sample, live)
+         endif
+         MarkRegionalProfile(target, ShapeRegionalSMP.Original(current) != current || regionalAux)
+         ReportActor(target, "$S3BA_GT", current, GroupLabel(group), index)
+     else
+         ReportActor(target, "$S3BA_WaitXML", current, GroupLabel(group), index)
+     endif
++EndFunction
++
++Bool Function TryEvaluateLiveGT(Actor target, ArmorAddon addon, string current, string path, int sample, int group, float index)
++    string family = GTLiveFamily(current)
++    if family == "" || family != GTLiveFamily(path)
++        return false
++    endif
++
++    string accepted = ShapePhysicsLive.GetTargetGT(target, addon)
++    if current == path && accepted == ""
++        return false
++    endif
++
++    accepted = AdvanceGTLiveTarget(target, addon, current, path, accepted, "body")
++    string status = "$S3BA_GT"
++    if accepted == path
++        rejectedGTLiveTarget = ""
++    else
++        status = "GT SMP QA (target rejected)"
++        if rejectedGTLiveTarget != path
++            rejectedGTLiveTarget = path
++            Debug.Trace("[ShapePhysicsLiveGTQA] body target rejected=" + path + " base=" + current)
++        endif
++    endif
++
++    playerGTLiveTarget = accepted
++    UpdateGTAuxiliary(target, sample, true)
++    MarkRegionalProfile(target, true)
++    ReportActor(target, status, current, GroupLabel(group), index)
++    return true
++EndFunction
++
++String Function AdvanceGTLiveTarget(Actor target, ArmorAddon addon, string current, string path, string accepted, string instanceName)
++    if accepted != path && (current != path || accepted != "")
++        if ShapePhysicsLive.BlendGT(target, addon, path, 0.5)
++            Debug.Trace("[ShapePhysicsLiveGTQA] " + instanceName + " target=" + path + " base=" + current)
++            return path
++        endif
++    endif
++    return accepted
++EndFunction
++
++String Function GTLiveFamily(string path)
++    string prefix = "SKSE\\Plugins\\hdtSkinnedMeshConfigs\\ShapePhysicsRegional\\"
++    if StringUtil.Find(path, prefix) != 0
++        return ""
++    endif
++    int prefixLength = StringUtil.GetLength(prefix)
++    int nameEnd = StringUtil.Find(path, "__", prefixLength)
++    if nameEnd <= prefixLength
++        return ""
++    endif
++    string template = StringUtil.Substring(path, prefixLength, nameEnd - prefixLength)
++    if template == "gt_small"
++        if StringUtil.Find(path, "__gt-growth1_gt_medium_gt_large_") < 0
++            return ""
++        endif
++    elseif template == "gt_slot60" || template == "gt_slot60_extended"
++        if StringUtil.Find(path, "__gt-regional4") < 0 || StringUtil.Find(path, "_r4_") < 0
++            return ""
++        endif
++    else
++        return ""
++    endif
++    int stampStart = nameEnd + 2
++    int stampEnd = StringUtil.Find(path, "__", stampStart)
++    if stampEnd != stampStart + 12
++        return ""
++    endif
++    return StringUtil.Substring(path, 0, stampEnd)
+ EndFunction
+ 
+ Bool Function HasGTAuxiliary(Actor target)
+@@ -1353,15 +1564,15 @@
+     return success && target.GetWornForm(slot) == armorItem
+ EndFunction
+ 
+-Bool Function Update3BAGTAuxiliary(Actor target, int sample, bool gtLower)
++Bool Function Update3BAGTAuxiliary(Actor target, int sample, bool gtLower, bool live = false)
+     if gtLower && ShapeUnifiedGTWeight.StockSelectorOff()
+-        return UpdateGTAuxiliary(target, sample)
++        return UpdateGTAuxiliary(target, sample, live)
+     endif
+     ClearGTAuxiliary(target, gtLower)
+     return false
+ EndFunction
+ 
+-Bool Function UpdateGTAuxiliary(Actor target, int sample)
++Bool Function UpdateGTAuxiliary(Actor target, int sample, bool live = false)
+     string trackingKey = "ShapePhysicsUnified.RegionalGTAux"
+     if !hasGTProfiles
+         sample = 0
+@@ -1372,6 +1583,7 @@
+     int slot = 0x40000000
+     Armor armorItem = target.GetWornForm(slot) as Armor
+     bool adjusted = false
++    bool reported = false
+     int i = 0
+     while armorItem && i < armorItem.GetNumArmorAddons()
+         ArmorAddon addon = armorItem.GetNthArmorAddon(i)
+@@ -1382,17 +1594,33 @@
+             if sample != 0
+                 expected = ComposeRegionalSMP(original, sample, -1.0, true, true, true)
+             endif
+-            if current != expected && target.GetWornForm(slot) == armorItem
+-                bool loaded = DynamicHDT.ReloadPhysicsFile(target, addon, expected, false)
+-                current = DynamicHDT.QueryCurrentPhysicsFile(target, addon)
+-                if !loaded && current != expected && target.GetWornForm(slot) == armorItem
+-                    ShapeRegionalSMP.Reject(expected)
++            string accepted = ""
++            if target.GetWornForm(slot) == armorItem
++                string family = ""
++                if live && sample != 0
++                    family = GTLiveFamily(current)
++                endif
++                if family != "" && family == GTLiveFamily(expected)
++                    accepted = ShapePhysicsLive.GetTargetGT(target, addon)
++                    accepted = AdvanceGTLiveTarget(target, addon, current, expected, accepted, "auxiliary")
++                elseif current != expected
++                    bool loaded = DynamicHDT.ReloadPhysicsFile(target, addon, expected, false)
++                    current = DynamicHDT.QueryCurrentPhysicsFile(target, addon)
++                    if !loaded && current != expected && target.GetWornForm(slot) == armorItem
++                        ShapeRegionalSMP.Reject(expected)
++                    endif
+                 endif
+             endif
+             if current == expected
+                 ShapeRegionalSMP.Confirm(current)
+             endif
+-            adjusted = adjusted || ShapeRegionalSMP.Original(current) != current
++            string loadedOriginal = ShapeRegionalSMP.Original(current)
++            if live && !reported && target.GetWornForm(slot) == armorItem && IsGTRegionalAux(loadedOriginal)
++                ; Match the first GT auxiliary selected by LoadedGTAuxXML.
++                playerGTLiveAuxTarget = accepted
++                reported = true
++            endif
++            adjusted = adjusted || loadedOriginal != current
+         endif
+         i += 1
+     endwhile
+@@ -2133,6 +2361,7 @@
+     AddTextOptionST("UNIFIED_BRANCH_SMP", "3BA SMP", PhysicsBranchStatus(2))
+     AddTextOptionST("UNIFIED_BRANCH_CBPC", "3BA CBPC", PhysicsBranchStatus(3))
+     AddHeaderOption(MenuText("$S3BA_Integrations"))
++    AddModuleStatus("Live SMP QA", hasLiveSMP)
+     AddModuleStatus("OBody NG", hasOBody)
+     AddModuleStatus("Papyrus Extender", HasNPCScanner())
+     AddModuleStatus("OStim Standalone", hasOStim)
+@@ -2358,13 +2587,16 @@
+     endif
+     string gtXML = player3BAGTAuxXML
+     if hasRegionalSMPComposer && ShapeRegionalSMP.SupportsZone(ShapeRegionalSMP.Original(gtXML), zone)
++        if player3BAMode == 4 || player3BAMode == 2
++            return LiveSMPZoneLabel(gtXML, playerGTLiveAuxTarget, zone, true)
++        endif
+         return LoadedSMPZoneLabel(gtXML, zone, "GT SMP")
+     endif
+     if Math.LogicalAnd(player3BASMPZones, Math.LeftShift(1, zone)) != 0
+-        return LoadedSMPZoneLabel(player3BASMPXML, zone, "3BA SMP")
++        return LiveSMPZoneLabel(player3BASMPXML, player3BALiveTarget, zone, false)
+     endif
+     if player3BAMode == 4
+-        return LoadedSMPZoneLabel(player3BASMPXML, zone, "GT SMP")
++        return LiveSMPZoneLabel(player3BASMPXML, playerGTLiveTarget, zone, true)
+     endif
+     int cbpc = ShapeRegionalCBPC.ZoneState(Game.GetPlayer(), zone, cbpcProfile)
+     if cbpc == -101
+@@ -2395,6 +2627,27 @@
+     return "CBPC - " + MenuText("$S3BA_ZoneNative")
+ EndFunction
+ 
++String Function LiveSMPZoneLabel(string baseXML, string liveTarget, int zone, bool gt)
++    string engine = "3BA SMP"
++    if gt
++        engine = "GT SMP"
++    endif
++    string baseLabel = LoadedSMPZoneLabel(baseXML, zone, engine)
++    if liveTarget != ""
++        bool sameFamily = false
++        if gt
++            sameFamily = GTLiveFamily(baseXML) == GTLiveFamily(liveTarget)
++        else
++            sameFamily = ThreeBALiveFamily(baseXML) == ThreeBALiveFamily(liveTarget)
++        endif
++        if sameFamily
++            zoneBlendHints[zone] = MenuText("$S3BA_XML") + " " + baseLabel
++            return LoadedSMPZoneLabel(liveTarget, zone, engine)
++        endif
++    endif
++    return baseLabel
++EndFunction
++
+ String Function LoadedSMPZoneLabel(string xml, int zone, string engine)
+     if !hasRegionalSMPComposer
+         return MenuText("$S3BA_ZoneUnverified")
+@@ -2404,8 +2657,9 @@
+         return engine + " - " + MenuText("$S3BA_ZoneUnverified")
+     endif
+     int level = ShapeRegionalSMP.ZoneLevel(xml, zone)
+-    bool measuredGT = engine == "GT SMP" && StringUtil.Find(xml, "_r4_") >= 0
+-    if level >= 0 && (level != 10 || measuredGT)
++    bool measured = engine == "GT SMP" && StringUtil.Find(xml, "_r4_") >= 0 \
++        || engine == "3BA SMP" && StringUtil.Find(xml, "__3ba-smooth_q") >= 0
++    if level >= 0 && (level != 10 || measured)
+         return engine + " - " + level + "/20"
+     elseif engine == "3BA SMP" && Original3BAXML(original) != ShapeUnified3BA.NativeXML(original)
+         int recipe = ManagedGroup(ShapeUnified3BA.NativeXML(original))

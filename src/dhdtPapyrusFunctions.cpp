@@ -5,27 +5,38 @@
 
 namespace
 {
-	struct LiveGTSystem
+	using hdt::LiveProfileKind;
+
+	struct LiveSystem
 	{
 		RE::BSTSmartPointer<hdt::SkyrimSystem> system;
 		std::string path;
+		bool ambiguous = false;
 	};
 
-	// Call with the actor manager lock held. Follow the manager's third-person
-	// skeleton selection and reject ambiguity rather than patching another mesh.
-	LiveGTSystem findLiveGTSystem(hdt::ActorManager& manager, const RE::Actor* actor, RE::FormID addon)
+	// Match the actor and ArmorAddon IDs as DynamicHDT does, then restrict the
+	// result to a single third-person system in the requested profile family.
+	// Call with the actor manager lock held.
+	LiveSystem findLiveSystem(hdt::ActorManager& manager, RE::FormID actor, RE::FormID addon,
+		LiveProfileKind kind, std::string_view requestedFamily = {})
 	{
-		LiveGTSystem result;
+		LiveSystem result;
+		const auto addonId = hdt::util::UInt32toString(addon);
 		for (auto& skeleton : manager.getSkeletons()) {
-			if (!skeleton.skeleton || skeleton.skeletonOwner.get() != actor ||
-			    hdt::isFirstPersonSkeleton(skeleton.skeleton.get()))
+			if (!skeleton.skeleton)
+				continue;
+			const auto* owner = skeleton.skeleton->GetUserData();
+			if (!owner || owner->formID != actor || hdt::isFirstPersonSkeleton(skeleton.skeleton.get()))
 				continue;
 			for (auto& armor : skeleton.getArmors()) {
 				if (!armor.armorWorn || !armor.hasPhysics() ||
-				    hdt::util::splitArmorAddonFormID(armor.armorWorn->name.c_str()) != addon)
+				    std::string_view(armor.armorWorn->name.c_str()).find(addonId) == std::string_view::npos)
+					continue;
+				const auto family = hdt::SkyrimSystemCreator::liveProfileFamily(armor.physicsFile.first);
+				if (family.kind != kind || (!requestedFamily.empty() && family.key != requestedFamily))
 					continue;
 				if (result.system)
-					return {};
+					return { {}, {}, true };
 				result = { armor.m_physics, armor.physicsFile.first };
 			}
 		}
@@ -34,64 +45,79 @@ namespace
 
 	int shapePhysicsLiveVersion(RE::StaticFunctionTag*)
 	{
-		return 1;
+		return 3;
 	}
 
-	RE::BSFixedString getTargetGT(RE::StaticFunctionTag*, RE::Actor* actor, RE::TESObjectARMA* addon)
+	template <LiveProfileKind Kind>
+	RE::BSFixedString getLiveTarget(RE::StaticFunctionTag*, RE::Actor* actor, RE::TESObjectARMA* addon)
 	{
 		if (!actor || !addon)
 			return "";
 		auto& manager = *hdt::ActorManager::instance();
 		auto guard = manager.lockGuard();
-		auto current = findLiveGTSystem(manager, actor, addon->formID);
+		auto current = findLiveSystem(manager, actor->formID, addon->formID, Kind);
 		if (!current.system)
 			return "";
 		auto simulation = hdt::SkyrimPhysicsWorld::get()->lockSimulation();
-		return current.system->liveGTTarget().c_str();
+		return current.system->liveTarget().c_str();
 	}
 
-	bool blendGT(RE::StaticFunctionTag*, RE::Actor* actor, RE::TESObjectARMA* addon,
+	template <LiveProfileKind Kind>
+	bool blendLiveTarget(RE::StaticFunctionTag*, RE::Actor* actor, RE::TESObjectARMA* addon,
 		RE::BSFixedString targetXml, float seconds)
 	{
 		if (!actor || !addon || !std::isfinite(seconds) || seconds < 0.05f || seconds > 5.f)
 			return false;
 		const std::string target(targetXml.c_str());
-		const auto family = hdt::SkyrimSystemCreator::liveGTProfileFamily(target);
-		if (family.empty())
+		const auto family = hdt::SkyrimSystemCreator::liveProfileFamily(target);
+		const auto* profileName = hdt::liveProfileName(Kind);
+		if (family.kind != Kind) {
+			logger::warn("[ShapePhysicsLive] Unsupported {} parameter target path {}", profileName, target);
 			return false;
+		}
 
 		auto& manager = *hdt::ActorManager::instance();
 		auto& world = *hdt::SkyrimPhysicsWorld::get();
-		LiveGTSystem original;
+		LiveSystem original;
 		std::string previous;
 		{
 			auto guard = manager.lockGuard();
-			original = findLiveGTSystem(manager, actor, addon->formID);
-			if (!original.system || hdt::SkyrimSystemCreator::liveGTProfileFamily(original.path) != family)
+			original = findLiveSystem(manager, actor->formID, addon->formID, Kind, family.key);
+			if (!original.system) {
+				if (original.ambiguous) {
+					logger::warn("[ShapePhysicsLive] Multiple attached {} systems match for actor {:08X}, ArmorAddon {:08X}, target {}",
+						profileName, actor->formID, addon->formID, target);
+				} else {
+					logger::warn("[ShapePhysicsLive] No attached {} system matches for actor {:08X}, ArmorAddon {:08X}, target {}",
+						profileName, actor->formID, addon->formID, target);
+				}
 				return false;
+			}
 			auto simulation = world.lockSimulation();
-			previous = original.system->liveGTTarget();
+			previous = original.system->liveTarget();
 			if (previous == target)
 				return true;
 		}
 
 		// The XML is only a coefficient source. No model or Bullet object is
 		// created by this parser, and it runs outside the simulation lock.
-		auto profile = hdt::SkyrimSystemCreator().readLiveGTProfile(target);
+		auto profile = hdt::SkyrimSystemCreator().readLiveProfile(target, Kind);
 		if (!profile) {
-			logger::warn("[ShapePhysicsLive] Could not read GT spring target {}", target);
+			logger::warn("[ShapePhysicsLive] Could not read {} parameter target {}", profileName, target);
 			return false;
 		}
 
 		auto guard = manager.lockGuard();
-		auto current = findLiveGTSystem(manager, actor, addon->formID);
-		if (current.system.get() != original.system.get() || current.path != original.path)
+		auto current = findLiveSystem(manager, actor->formID, addon->formID, Kind, family.key);
+		if (current.system.get() != original.system.get() || current.path != original.path) {
+			logger::info("[ShapePhysicsLive] {} attachment changed while reading target {}", profileName, target);
 			return false;
+		}
 		auto simulation = world.lockSimulation();
-		if (current.system->liveGTTarget() != previous)
-			return current.system->liveGTTarget() == target;
-		if (!current.system->blendGTSprings(*profile, target, seconds)) {
-			logger::warn("[ShapePhysicsLive] Rejected GT spring target {} for the attached system", target);
+		if (current.system->liveTarget() != previous)
+			return current.system->liveTarget() == target;
+		if (!current.system->blendLiveProfile(*profile, target, seconds)) {
+			logger::warn("[ShapePhysicsLive] Rejected {} parameter target {} for the attached system", profileName, target);
 			return false;
 		}
 		return true;
@@ -107,8 +133,10 @@ bool RegisterFuncs(RE::BSScript::IVirtualMachine* registry)
 	registry->RegisterFunction("TogglePhysics", "DynamicHDT", hdt::papyrus::TogglePhysics);
 	registry->RegisterFunction("ResetPhysics", "DynamicHDT", hdt::papyrus::ResetPhysics);
 	registry->RegisterFunction("GetVersion", "ShapePhysicsLive", shapePhysicsLiveVersion);
-	registry->RegisterFunction("GetTargetGT", "ShapePhysicsLive", getTargetGT);
-	registry->RegisterFunction("BlendGT", "ShapePhysicsLive", blendGT);
+	registry->RegisterFunction("GetTargetGT", "ShapePhysicsLive", getLiveTarget<LiveProfileKind::GT>);
+	registry->RegisterFunction("BlendGT", "ShapePhysicsLive", blendLiveTarget<LiveProfileKind::GT>);
+	registry->RegisterFunction("GetTarget3BA", "ShapePhysicsLive", getLiveTarget<LiveProfileKind::ThreeBA>);
+	registry->RegisterFunction("Blend3BA", "ShapePhysicsLive", blendLiveTarget<LiveProfileKind::ThreeBA>);
 	//
 	return true;
 }

@@ -6,6 +6,7 @@
 #include "Patterns/hdtXmlPatternExpander.h"
 #include "XmlReader.h"
 #include "hdtSkyrimPhysicsWorld.h"
+#include <array>
 #include <cmath>
 
 // F16C isn't supported on super old processors. AVX2+ (AVX processors can have it, but not guaranteed)
@@ -163,55 +164,153 @@ namespace hdt
 
 	namespace
 	{
-		bool hasGTChestBone(const SkyrimSystem::LiveGTLink& link)
+		enum class LiveZone { Chest, Glutes, Abdomen, Thighs, Unsupported };
+
+		bool is3BAChestBone(std::string_view name)
 		{
-			const auto isChest = [](std::string_view name) {
-				return name.starts_with("Soft_L") || name.starts_with("Soft_R");
-			};
-			return isChest(link.bodyA) || isChest(link.bodyB);
+			return name == "L Breast01" || name == "R Breast01" ||
+			       name == "L Breast02" || name == "R Breast02" ||
+			       name == "L Breast03" || name == "R Breast03";
 		}
 
-		bool isSafeGTSpringVector(const btVector3& vector)
+		LiveZone liveZone(const SkyrimSystem::LiveConstraint& link, LiveProfileKind kind)
+		{
+			const auto isPair = [&](std::string_view a, std::string_view b) {
+				return (link.bodyA == a && link.bodyB == b) || (link.bodyA == b && link.bodyB == a);
+			};
+
+			if (kind == LiveProfileKind::GT) {
+				const auto isChest = [](std::string_view name) {
+					return name.starts_with("Soft_L") || name.starts_with("Soft_R");
+				};
+				if (isChest(link.bodyA) || isChest(link.bodyB))
+					return LiveZone::Chest;
+				if (isPair("HDT Belly", "Belly") || isPair("NPC Belly", "HDT Belly"))
+					return LiveZone::Abdomen;
+				if (isPair("NPC L FrontThigh", "NPC L PreFrontThigh") ||
+				    isPair("NPC R FrontThigh", "NPC R PreFrontThigh") ||
+				    isPair("NPC L RearThigh", "NPC L PreRearThigh") ||
+				    isPair("NPC R RearThigh", "NPC R PreRearThigh"))
+					return LiveZone::Thighs;
+			} else if (kind == LiveProfileKind::ThreeBA) {
+				if (isPair("L Breast01", "L Breast00") || isPair("R Breast01", "R Breast00") ||
+				    isPair("L Breast02", "L Breast00") || isPair("R Breast02", "R Breast00") ||
+				    isPair("L Breast02", "L Breast01") || isPair("R Breast02", "R Breast01") ||
+				    isPair("L Breast03", "L Breast01") || isPair("R Breast03", "R Breast01") ||
+				    isPair("L Breast03", "L Breast02") || isPair("R Breast03", "R Breast02"))
+					return LiveZone::Chest;
+				if (isPair("NPC Belly", "Belly"))
+					return LiveZone::Abdomen;
+				if (isPair("NPC L FrontThigh", "NPC L Thigh [LThg]") ||
+				    isPair("NPC R FrontThigh", "NPC R Thigh [RThg]") ||
+				    isPair("NPC L RearThigh", "NPC L Thigh [LThg]") ||
+				    isPair("NPC R RearThigh", "NPC R Thigh [RThg]"))
+					return LiveZone::Thighs;
+			}
+
+			if (isPair("NPC L Butt", "NPC L PreButt") || isPair("NPC R Butt", "NPC R PreButt"))
+				return LiveZone::Glutes;
+			return LiveZone::Unsupported;
+		}
+
+		bool isSafeLiveVector(const btVector3& vector, float lower = 0.f, float upper = 1.0e7f)
 		{
 			for (int axis = 0; axis < 3; ++axis) {
-				if (!std::isfinite(vector[axis]) || vector[axis] < 0 || vector[axis] > 1.0e7f)
+				if (!std::isfinite(vector[axis]) || vector[axis] < lower || vector[axis] > upper)
 					return false;
 			}
 			return true;
 		}
 
-		bool sameGTSprings(const SkyrimSystem::LiveGTSprings& a, const SkyrimSystem::LiveGTSprings& b)
+		bool isSafeLiveParameters(const SkyrimSystem::LiveConstraintParameters& p)
 		{
-			return a.linearStiffness == b.linearStiffness && a.angularStiffness == b.angularStiffness &&
-			       a.linearDamping == b.linearDamping && a.angularDamping == b.angularDamping;
+			return isSafeLiveVector(p.linearStiffness) && isSafeLiveVector(p.angularStiffness) &&
+			       isSafeLiveVector(p.linearDamping) && isSafeLiveVector(p.angularDamping) &&
+			       isSafeLiveVector(p.linearLower, -1.0e7f) && isSafeLiveVector(p.linearUpper, -1.0e7f) &&
+			       isSafeLiveVector(p.angularLower, -1.0e7f) && isSafeLiveVector(p.angularUpper, -1.0e7f);
 		}
 
-		bool isSafeStiffnessScale(float scale)
+		bool isSafeNonHookeanFactors(const SkyrimSystem::LiveConstraintParameters& p)
+		{
+			// Bullet applies these multipliers to the ordinary coefficients.
+			// The generated factors stay in this range, including negative values.
+			return isSafeLiveVector(p.linearNonHookeanStiffness, -1.f, 1.f) &&
+			       isSafeLiveVector(p.angularNonHookeanStiffness, -1.f, 1.f) &&
+			       isSafeLiveVector(p.linearNonHookeanDamping, -1.f, 1.f) &&
+			       isSafeLiveVector(p.angularNonHookeanDamping, -1.f, 1.f);
+		}
+
+		bool isSafeGravityFactor(float factor)
+		{
+			return std::isfinite(factor) && factor >= 0.f && factor <= 1.f;
+		}
+
+		bool isSafeLiveScale(float scale)
 		{
 			return std::isfinite(scale) && scale >= 1.0e-6f && scale <= 1.0e6f;
 		}
+
+		// Bullet treats lower > upper as free. Keep the source limits on any
+		// axis whose target changes that state (the solver row would appear or
+		// disappear abruptly). Bounded-to-locked axes can narrow continuously.
+		int keepFreeLimitMode(const btVector3& lower, const btVector3& upper, btVector3& targetLower, btVector3& targetUpper)
+		{
+			int kept = 0;
+			for (int axis = 0; axis < 3; ++axis) {
+				if ((lower[axis] > upper[axis]) != (targetLower[axis] > targetUpper[axis])) {
+					targetLower[axis] = lower[axis];
+					targetUpper[axis] = upper[axis];
+					++kept;
+				}
+			}
+			return kept;
+		}
 	}
 
-	bool SkyrimSystem::LiveGTLink::matches(const LiveGTLink& target) const
+	bool SkyrimSystem::LiveConstraint::matches(const LiveConstraint& target) const
 	{
 		return bodyA == target.bodyA && bodyB == target.bodyB && preset == target.preset &&
 		       reversed == target.reversed && linearEnabled == target.linearEnabled &&
 		       angularEnabled == target.angularEnabled && limitLinearStiffness == target.limitLinearStiffness &&
-		       limitAngularStiffness == target.limitAngularStiffness && limitDamping == target.limitDamping;
+		       limitAngularStiffness == target.limitAngularStiffness && limitDamping == target.limitDamping &&
+		       linearMotors == target.linearMotors && angularMotors == target.angularMotors &&
+		       linearServos == target.linearServos && angularServos == target.angularServos;
 	}
 
-	bool SkyrimSystem::blendGTSprings(const std::vector<LiveGTLink>& target, std::string path, float seconds)
+	bool SkyrimSystem::blendLiveProfile(const LiveProfile& target, std::string path, float seconds)
 	{
-		if (m_attachedGTLinks.empty() || m_attachedGTLinks.size() != target.size())
+		if (m_liveConstraints.empty() || m_liveConstraints.size() != target.constraints.size() ||
+		    m_liveBones.size() != target.gravity.size())
 			return false;
 
-		std::vector<LerpGTLink> transition;
-		transition.reserve(target.size());
+		const bool is3BA = m_liveProfileKind == LiveProfileKind::ThreeBA;
+		std::vector<LiveGravityTransition> gravity;
+		gravity.reserve(target.gravity.size());
+		for (size_t index = 0; index < target.gravity.size(); ++index) {
+			const auto& attached = m_liveBones[index];
+			const auto& goal = target.gravity[index];
+			if (attached.name != goal.bone || attached.preset != goal.preset || !isSafeGravityFactor(goal.factor))
+				return false;
+			auto* bone = attached.bone;
+			if (!bone || bone->m_rig.isStaticOrKinematicObject() || (bone->m_rig.getFlags() & BT_DISABLE_WORLD_GRAVITY))
+				continue;
+			if (!isSafeGravityFactor(bone->m_gravityFactor))
+				return false;
+			if (bone->m_gravityFactor != goal.factor)
+				gravity.push_back({ bone, bone->m_gravityFactor, goal.factor });
+		}
+
+		std::vector<LiveConstraintTransition> transition;
+		transition.reserve(target.constraints.size());
 		size_t matched = 0;
-		for (size_t index = 0; index < target.size(); ++index) {
-			const auto& attached = m_attachedGTLinks[index];
-			const auto& goal = target[index];
-			if (attached.source.bodyA != goal.bodyA || attached.source.bodyB != goal.bodyB ||
+		std::array<size_t, 4> changedByZone{};
+		int keptAxes = 0;
+		for (size_t index = 0; index < target.constraints.size(); ++index) {
+			const auto& attached = m_liveConstraints[index];
+			const auto& goal = target.constraints[index];
+			const auto zone = liveZone(goal, m_liveProfileKind);
+			if (zone == LiveZone::Unsupported ||
+			    attached.source.bodyA != goal.bodyA || attached.source.bodyB != goal.bodyB ||
 			    attached.source.preset != goal.preset)
 				return false;
 
@@ -225,55 +324,88 @@ namespace hdt
 
 			const auto linearScale = constraint->linearStiffnessScale();
 			const auto angularScale = constraint->angularStiffnessScale();
-			if (!isSafeStiffnessScale(linearScale) || !isSafeStiffnessScale(angularScale))
+			const auto limitScale = constraint->linearLimitScale();
+			if (!isSafeLiveScale(linearScale) || !isSafeLiveScale(angularScale) || !isSafeLiveScale(limitScale))
 				return false;
 
 			const auto* linear = constraint->getTranslationalLimitMotor();
-			LiveGTSprings start;
-			start.linearStiffness = linear->m_springStiffness / linearScale;
-			start.linearDamping = linear->m_springDamping;
+			LiveConstraintParameters start;
 			for (int axis = 0; axis < 3; ++axis) {
+				// The motor initializes the three axes, not btVector3's fourth component.
+				start.linearStiffness[axis] = linear->m_springStiffness[axis] / linearScale;
+				start.linearDamping[axis] = linear->m_springDamping[axis];
+				start.linearLower[axis] = linear->m_lowerLimit[axis] / limitScale;
+				start.linearUpper[axis] = linear->m_upperLimit[axis] / limitScale;
 				const auto* angular = constraint->getRotationalLimitMotor(axis);
 				start.angularStiffness[axis] = angular->m_springStiffness / angularScale;
 				start.angularDamping[axis] = angular->m_springDamping;
+				start.angularLower[axis] = angular->m_loLimit;
+				start.angularUpper[axis] = angular->m_hiLimit;
+				if (is3BA) {
+					start.linearNonHookeanStiffness[axis] = linear->m_nonHookeanStiffness[axis];
+					start.linearNonHookeanDamping[axis] = linear->m_nonHookeanDamping[axis];
+					start.angularNonHookeanStiffness[axis] = angular->m_nonHookeanStiffness;
+					start.angularNonHookeanDamping[axis] = angular->m_nonHookeanDamping;
+				}
 			}
+			if (!isSafeLiveParameters(start) || (is3BA && !isSafeNonHookeanFactors(start)))
+				return false;
+			LiveConstraintParameters end = goal.parameters;
+			keptAxes += keepFreeLimitMode(start.linearLower, start.linearUpper, end.linearLower, end.linearUpper);
+			keptAxes += keepFreeLimitMode(start.angularLower, start.angularUpper, end.angularLower, end.angularUpper);
 			++matched;
-			if (!sameGTSprings(start, goal.springs))
-				transition.push_back({ constraint, start, goal.springs });
+			if (start != end) {
+				++changedByZone[static_cast<size_t>(zone)];
+				transition.push_back({ constraint, start, end });
+			}
 		}
 		if (matched == 0)
 			return false;
 
-		logger::info("[ShapePhysicsLive] Accepted GT spring target {} ({} links changing, {} seconds)",
-			path, transition.size(), seconds);
-		m_liveGTTarget = std::move(path);
-		m_lerpGTLinks = std::move(transition);
-		m_liveGTElapsed = 0;
-		m_liveGTDuration = seconds;
+		const auto* profileName = liveProfileName(m_liveProfileKind);
+		logger::info("[ShapePhysicsLive] Accepted {} parameter target {} ({} links changing: chest {}, glutes {}, abdomen {}, thighs {}; {} limit axes held; {} seconds)",
+			profileName, path, transition.size(), changedByZone[0], changedByZone[1], changedByZone[2], changedByZone[3], keptAxes, seconds);
+		if (!gravity.empty())
+			logger::info("[ShapePhysicsLive] Blending {} 3BA SMP chest gravity factors for {}", gravity.size(), path);
+		m_liveTarget = std::move(path);
+		m_liveConstraintTransitions = std::move(transition);
+		m_liveGravityTransitions = std::move(gravity);
+		m_liveElapsed = 0;
+		m_liveDuration = seconds;
+		if (m_liveConstraintTransitions.empty() && m_liveGravityTransitions.empty())
+			logger::info("[ShapePhysicsLive] {} parameters already match {}", profileName, m_liveTarget);
 		return true;
 	}
 
 	void SkyrimSystem::readTransform(float timeStep)
 	{
 		SkinnedMeshSystem::readTransform(timeStep);
-		if (block_resetting || m_lerpGTLinks.empty() || !std::isfinite(timeStep) || timeStep <= 0)
+		if (block_resetting || (m_liveConstraintTransitions.empty() && m_liveGravityTransitions.empty()) ||
+		    !std::isfinite(timeStep) || timeStep <= 0)
 			return;
 
 		// The world holds its simulation mutex here. The base implementation
 		// has already updated bone scales; Bullet has not started its step.
-		m_liveGTElapsed = std::min(m_liveGTDuration, m_liveGTElapsed + timeStep);
-		const float progress = m_liveGTElapsed / m_liveGTDuration;
+		m_liveElapsed = std::min(m_liveDuration, m_liveElapsed + timeStep);
+		const float progress = m_liveElapsed / m_liveDuration;
 		const float weight = progress * progress * (3.f - 2.f * progress);
-		for (const auto& link : m_lerpGTLinks) {
+		const bool is3BA = m_liveProfileKind == LiveProfileKind::ThreeBA;
+		for (const auto& link : m_liveConstraintTransitions) {
 			auto* constraint = link.constraint;
 			const auto linearScale = constraint->linearStiffnessScale();
 			const auto angularScale = constraint->angularStiffnessScale();
-			if (!isSafeStiffnessScale(linearScale) || !isSafeStiffnessScale(angularScale)) {
-				m_liveGTTarget.clear();
-				m_lerpGTLinks.clear();
-				logger::warn("[ShapePhysicsLive] Stopped GT spring transition after an invalid bone scale");
+			const auto limitScale = constraint->linearLimitScale();
+			if (!isSafeLiveScale(linearScale) || !isSafeLiveScale(angularScale) || !isSafeLiveScale(limitScale)) {
+				m_liveTarget.clear();
+				m_liveConstraintTransitions.clear();
+				m_liveGravityTransitions.clear();
+				logger::warn("[ShapePhysicsLive] Stopped {} parameter transition after an invalid bone scale", liveProfileName(m_liveProfileKind));
 				return;
 			}
+			constraint->setLinearLowerLimit(link.start.linearLower.lerp(link.target.linearLower, weight) * limitScale);
+			constraint->setLinearUpperLimit(link.start.linearUpper.lerp(link.target.linearUpper, weight) * limitScale);
+			constraint->setAngularLowerLimit(link.start.angularLower.lerp(link.target.angularLower, weight));
+			constraint->setAngularUpperLimit(link.start.angularUpper.lerp(link.target.angularUpper, weight));
 			const auto* linear = constraint->getTranslationalLimitMotor();
 			for (int axis = 0; axis < 3; ++axis) {
 				const auto* angular = constraint->getRotationalLimitMotor(axis);
@@ -285,18 +417,31 @@ namespace hdt
 					link.target.linearDamping[axis], weight), linear->m_springDampingLimited[axis]);
 				constraint->setDamping(axis + 3, std::lerp(link.start.angularDamping[axis],
 					link.target.angularDamping[axis], weight), angular->m_springDampingLimited);
+				if (is3BA) {
+					// These factors are dimensionless and the stock scaler leaves them unchanged.
+					constraint->setNonHookeanStiffness(axis, std::lerp(link.start.linearNonHookeanStiffness[axis],
+						link.target.linearNonHookeanStiffness[axis], weight));
+					constraint->setNonHookeanStiffness(axis + 3, std::lerp(link.start.angularNonHookeanStiffness[axis],
+						link.target.angularNonHookeanStiffness[axis], weight));
+					constraint->setNonHookeanDamping(axis, std::lerp(link.start.linearNonHookeanDamping[axis],
+						link.target.linearNonHookeanDamping[axis], weight));
+					constraint->setNonHookeanDamping(axis + 3, std::lerp(link.start.angularNonHookeanDamping[axis],
+						link.target.angularNonHookeanDamping[axis], weight));
+				}
 			}
 		}
+		for (const auto& bone : m_liveGravityTransitions)
+			bone.bone->m_gravityFactor = std::lerp(bone.start, bone.target, weight);
 		if (progress == 1.f) {
-			m_lerpGTLinks.clear();
-			logger::info("[ShapePhysicsLive] Finished GT spring transition to {}", m_liveGTTarget);
+			m_liveConstraintTransitions.clear();
+			m_liveGravityTransitions.clear();
+			logger::info("[ShapePhysicsLive] Finished {} parameter transition to {}", liveProfileName(m_liveProfileKind), m_liveTarget);
 		}
 	}
 
-	std::string SkyrimSystemCreator::liveGTProfileFamily(std::string_view path)
+	SkyrimSystemCreator::LiveProfileFamily SkyrimSystemCreator::liveProfileFamily(std::string_view path)
 	{
-		constexpr std::string_view prefix = "skse\\plugins\\hdtskinnedmeshconfigs\\shapephysicsregional\\gt_small__";
-		constexpr std::string_view continuous = "__gt-growth1_gt_medium_gt_large";
+		constexpr std::string_view directory = "skse\\plugins\\hdtskinnedmeshconfigs\\shapephysicsregional\\";
 		if (path.size() > 240)
 			return {};
 		std::string normalized(path);
@@ -306,12 +451,36 @@ namespace hdt
 			else if (c >= 'A' && c <= 'Z')
 				c = static_cast<char>(c - 'A' + 'a');
 		}
-		if (!normalized.starts_with(prefix) || !normalized.ends_with(".xml"))
+		if (!normalized.starts_with(directory) || !normalized.ends_with(".xml"))
 			return {};
-		const std::string_view name(normalized.data() + prefix.size(), normalized.size() - prefix.size());
+		const std::string_view file(normalized.data() + directory.size(), normalized.size() - directory.size());
+		const auto separator = file.find("__");
+		if (separator == std::string_view::npos)
+			return {};
+		const auto id = file.substr(0, separator);
+		const auto name = file.substr(separator + 2);
+		auto kind = LiveProfileKind::GT;
+		if (id == "gt_small") {
+			if (name.find("__gt-growth1_gt_medium_gt_large_") == std::string_view::npos)
+				return {};
+		} else if (id == "gt_slot60" || id == "gt_slot60_extended") {
+			if (name.find("__gt-regional4") == std::string_view::npos || name.find("_r4_") == std::string_view::npos)
+				return {};
+		} else if (id.starts_with("threeba_")) {
+			auto variant = id.substr(8);
+			if (variant.starts_with("full_"))
+				variant.remove_prefix(5);
+			if (variant.size() > 2 && variant[0] >= 'a' && variant[0] <= 'd' && variant[1] == '_')
+				variant.remove_prefix(2);
+			if ((variant != "base" && variant != "small" && variant != "large") ||
+			    name.find("__3ba-smooth_q") == std::string_view::npos)
+				return {};
+			kind = LiveProfileKind::ThreeBA;
+		} else {
+			return {};
+		}
 		const auto stampEnd = name.find("__");
-		if (stampEnd != 12 || name.find(continuous) == std::string_view::npos ||
-		    name.find("..") != std::string_view::npos)
+		if (stampEnd != 12 || name.find("..") != std::string_view::npos)
 			return {};
 		for (size_t i = 0; i < name.size(); ++i) {
 			const auto c = name[i];
@@ -323,10 +492,10 @@ namespace hdt
 				return {};
 			}
 		}
-		return normalized.substr(0, prefix.size() + stampEnd);
+		return { kind, normalized.substr(0, directory.size() + separator + 2 + stampEnd) };
 	}
 
-	std::optional<std::vector<SkyrimSystem::LiveGTLink>> SkyrimSystemCreator::readLiveGTProfile(const std::string& path)
+	std::optional<SkyrimSystem::LiveProfile> SkyrimSystemCreator::readLiveProfile(const std::string& path, LiveProfileKind kind)
 	{
 		auto xml = readAllFile(path.c_str());
 		if (xml.empty())
@@ -337,7 +506,32 @@ namespace hdt
 		if (reader.GetName() != "system")
 			return std::nullopt;
 
-		std::vector<SkyrimSystem::LiveGTLink> links;
+		SkyrimSystem::LiveProfile profile;
+		const bool is3BA = kind == LiveProfileKind::ThreeBA;
+		std::unordered_map<std::string, float> gravityDefaults;
+		const auto getGravityDefault = [&](const std::string& preset) {
+			auto found = gravityDefaults.find(preset);
+			if (found == gravityDefaults.end())
+				found = gravityDefaults.find("");
+			return found == gravityDefaults.end() ? 1.f : found->second;
+		};
+		const auto readGravity = [&](float initial) {
+			// Read the same per-bone field as the regular loader without constructing shapes.
+			while (reader.Inspect()) {
+				if (reader.GetInspected() == XMLReader::Inspected::EndTag)
+					break;
+				if (reader.GetInspected() != XMLReader::Inspected::StartTag)
+					continue;
+				if (reader.GetName() == "gravity-factor") {
+					initial = reader.readFloat();
+					if (std::isfinite(initial))
+						initial = std::clamp(initial, 0.f, 1.f);
+				} else {
+					reader.skipCurrentElement();
+				}
+			}
+			return initial;
+		};
 		try {
 			while (reader.Inspect()) {
 				if (reader.GetInspected() == XMLReader::Inspected::EndTag)
@@ -346,48 +540,82 @@ namespace hdt
 					continue;
 
 				const auto name = reader.GetName();
-				if (name == "generic-constraint-default") {
+				if (is3BA && name == "bone-default") {
+					const auto preset = reader.getAttribute("name", "");
+					const auto extends = reader.getAttribute("extends", "");
+					const auto factor = readGravity(getGravityDefault(extends));
+					if (!isSafeGravityFactor(factor))
+						return std::nullopt;
+					gravityDefaults[preset] = factor;
+				} else if (is3BA && name == "bone") {
+					auto bone = reader.getAttribute("name");
+					if (!is3BAChestBone(bone)) {
+						reader.skipCurrentElement();
+						continue;
+					}
+					auto preset = reader.getAttribute("template", "");
+					const auto factor = readGravity(getGravityDefault(preset));
+					if (!isSafeGravityFactor(factor))
+						return std::nullopt;
+					profile.gravity.push_back({ std::move(bone), std::move(preset), factor });
+				} else if (name == "generic-constraint-default") {
 					const auto className = reader.getAttribute("name", "");
 					const auto extends = reader.getAttribute("extends", "");
 					auto values = getGenericConstraintTemplate(extends);
 					readGenericConstraintTemplate(values);
 					m_genericConstraintTemplates[className] = values;
 				} else if (name == "generic-constraint") {
-					SkyrimSystem::LiveGTLink link{ reader.getAttribute("bodyA"), reader.getAttribute("bodyB"), reader.getAttribute("template", "") };
-					if (!hasGTChestBone(link)) {
+					SkyrimSystem::LiveConstraint link{ reader.getAttribute("bodyA"), reader.getAttribute("bodyB"), reader.getAttribute("template", "") };
+					if (liveZone(link, kind) == LiveZone::Unsupported) {
 						reader.skipCurrentElement();
 						continue;
 					}
 					auto values = getGenericConstraintTemplate(link.preset);
 					readGenericConstraintTemplate(values);
-					readLiveGTLinkSettings(link, values);
-					if (!isSafeGTSpringVector(link.springs.linearStiffness) || !isSafeGTSpringVector(link.springs.angularStiffness) ||
-					    !isSafeGTSpringVector(link.springs.linearDamping) || !isSafeGTSpringVector(link.springs.angularDamping))
+					readLiveConstraintSettings(link, values, is3BA);
+					if (!isSafeLiveParameters(link.parameters) || (is3BA && !isSafeNonHookeanFactors(link.parameters)))
 						return std::nullopt;
-					links.push_back(std::move(link));
+					// Match the normalization applied by Bullet's angular limit setters.
+					for (int axis = 0; axis < 3; ++axis) {
+						link.parameters.angularLower[axis] = btNormalizeAngle(link.parameters.angularLower[axis]);
+						link.parameters.angularUpper[axis] = btNormalizeAngle(link.parameters.angularUpper[axis]);
+					}
+					profile.constraints.push_back(std::move(link));
 				} else {
 					reader.skipCurrentElement();
 				}
 			}
 		} catch (const std::string& error) {
-			logger::warn("[ShapePhysicsLive] Invalid GT spring target {}: {}", path, error);
+			logger::warn("[ShapePhysicsLive] Invalid {} parameter target {}: {}", liveProfileName(kind), path, error);
 			return std::nullopt;
 		}
-		if (links.empty() || reader.GetErrorCode() != Xml::ErrorCode::None ||
+		if (profile.constraints.empty() || reader.GetErrorCode() != Xml::ErrorCode::None ||
 		    reader.GetInspected() != XMLReader::Inspected::EndTag || reader.GetName() != "system")
 			return std::nullopt;
-		return links;
+		return profile;
 	}
 
-	void SkyrimSystemCreator::readLiveGTLinkSettings(SkyrimSystem::LiveGTLink& link, const GenericConstraintTemplate& values)
+	void SkyrimSystemCreator::readLiveConstraintSettings(SkyrimSystem::LiveConstraint& link, const GenericConstraintTemplate& values,
+		bool includeNonHookean)
 	{
-		link.springs = { values.linearStiffness, values.angularStiffness, values.linearDamping, values.angularDamping };
+		link.parameters = { values.linearStiffness, values.angularStiffness, values.linearDamping, values.angularDamping,
+			values.linearLowerLimit, values.linearUpperLimit, values.angularLowerLimit, values.angularUpperLimit };
+		if (includeNonHookean) {
+			link.parameters.linearNonHookeanStiffness = values.linearNonHookeanStiffness;
+			link.parameters.angularNonHookeanStiffness = values.angularNonHookeanStiffness;
+			link.parameters.linearNonHookeanDamping = values.linearNonHookeanDamping;
+			link.parameters.angularNonHookeanDamping = values.angularNonHookeanDamping;
+		}
 		link.reversed = values.useLinearReferenceFrameA;
 		link.linearEnabled = values.enableLinearSprings;
 		link.angularEnabled = values.enableAngularSprings;
 		link.limitLinearStiffness = values.linearStiffnessLimited;
 		link.limitAngularStiffness = values.angularStiffnessLimited;
 		link.limitDamping = values.springDampingLimited;
+		link.linearMotors = values.linearMotors;
+		link.angularMotors = values.angularMotors;
+		link.linearServos = values.linearServoMotors;
+		link.angularServos = values.angularServoMotors;
 	}
 
 	void SkyrimSystemCreator::indexBone(SkyrimBone* bone)
@@ -484,7 +712,7 @@ namespace hdt
 		auto meshNameMap = file->second;
 
 		m_mesh = RE::make_smart<SkyrimSystem>(skeleton);
-		m_collectLiveGTLinks = !liveGTProfileFamily(path).empty();
+		m_mesh->m_liveProfileKind = liveProfileFamily(path).kind;
 		m_boneIndex.clear();
 
 		// This forces the skeleton into a neutral reference pose, which avoids building invalid shape data
@@ -896,7 +1124,13 @@ namespace hdt
 
 	void SkyrimSystemCreator::readOrUpdateBone()
 	{
-		RE::BSFixedString name = getRenamedBone(m_reader->getAttribute("name"));
+		const auto sourceName = m_reader->getAttribute("name");
+		RE::BSFixedString name = getRenamedBone(sourceName);
+		SkyrimSystem::AttachedLiveBone* attached = nullptr;
+		if (m_mesh->m_liveProfileKind == LiveProfileKind::ThreeBA && is3BAChestBone(sourceName)) {
+			m_mesh->m_liveBones.push_back({ sourceName, m_reader->getAttribute("template", ""), nullptr });
+			attached = &m_mesh->m_liveBones.back();
+		}
 		if (findBoneFromIndex(name)) {
 			logger::warn("Bone {} already exists, skipped", name.c_str());
 			m_reader->skipCurrentElement();
@@ -904,8 +1138,11 @@ namespace hdt
 		}
 
 		RE::BSFixedString cls = m_reader->getAttribute("template", "");
-		if (!createBoneFromNodeName(name, cls, true))
+		auto* bone = createBoneFromNodeName(name, cls, true);
+		if (!bone)
 			m_reader->skipCurrentElement();
+		if (attached)
+			attached->bone = bone;
 	}
 
 	SkyrimBone* SkyrimSystemCreator::createBoneFromNodeName(const RE::BSFixedString& bodyName, const RE::BSFixedString& templateName, const bool readTemplate)
@@ -1470,14 +1707,15 @@ namespace hdt
 
 	RE::BSTSmartPointer<Generic6DofConstraint> SkyrimSystemCreator::readGenericConstraint()
 	{
-		SkyrimSystem::LiveGTLink link{ m_reader->getAttribute("bodyA"), m_reader->getAttribute("bodyB"), m_reader->getAttribute("template", "") };
+		SkyrimSystem::LiveConstraint link{ m_reader->getAttribute("bodyA"), m_reader->getAttribute("bodyB"), m_reader->getAttribute("template", "") };
 		auto bodyAName = getRenamedBone(link.bodyA);
 		auto bodyBName = getRenamedBone(link.bodyB);
 		auto clsname = link.preset;
-		SkyrimSystem::AttachedGTLink* attached = nullptr;
-		if (m_collectLiveGTLinks && hasGTChestBone(link)) {
-			m_mesh->m_attachedGTLinks.push_back({ std::move(link) });
-			attached = &m_mesh->m_attachedGTLinks.back();
+		const auto liveKind = m_mesh->m_liveProfileKind;
+		SkyrimSystem::AttachedLiveConstraint* attached = nullptr;
+		if (liveKind != LiveProfileKind::None && liveZone(link, liveKind) != LiveZone::Unsupported) {
+			m_mesh->m_liveConstraints.push_back({ std::move(link) });
+			attached = &m_mesh->m_liveConstraints.back();
 		}
 
 		SkyrimBone *bodyA, *bodyB;
@@ -1555,7 +1793,7 @@ namespace hdt
 		constraint->getRotationalLimitMotor(2)->m_limitSoftness = 1;*/
 
 		if (attached) {
-			readLiveGTLinkSettings(attached->source, cinfo);
+			readLiveConstraintSettings(attached->source, cinfo, liveKind == LiveProfileKind::ThreeBA);
 			attached->constraint = constraint.get();
 		}
 

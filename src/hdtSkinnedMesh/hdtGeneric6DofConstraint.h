@@ -18,9 +18,11 @@ namespace hdt
 		void scaleConstraint() override;
 		float linearStiffnessScale() const { return m_linearStiffnessScale; }
 		float angularStiffnessScale() const { return m_angularStiffnessScale; }
+		float linearLimitScale() const { return m_linearLimitScale; }
 
 	private:
 		float m_linearStiffnessScale = 1.f;
 		float m_angularStiffnessScale = 1.f;
+		float m_linearLimitScale = 1.f;
 	};
 }

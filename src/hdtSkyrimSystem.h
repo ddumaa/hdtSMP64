@@ -13,6 +13,13 @@
 
 namespace hdt
 {
+	enum class LiveProfileKind { None, GT, ThreeBA };
+
+	inline const char* liveProfileName(LiveProfileKind kind)
+	{
+		return kind == LiveProfileKind::ThreeBA ? "3BA SMP" : "GT";
+	}
+
 	class PerVertexShape;
 	class SkyrimSystem : public SkinnedMeshSystem
 	{
@@ -35,34 +42,61 @@ namespace hdt
 		float prepareForRead(float timeStep) override;
 		void readTransform(float timeStep) override;
 
-		struct LiveGTSprings
+		struct LiveConstraintParameters
 		{
 			btVector3 linearStiffness{ 0, 0, 0 };
 			btVector3 angularStiffness{ 0, 0, 0 };
 			btVector3 linearDamping{ 0, 0, 0 };
 			btVector3 angularDamping{ 0, 0, 0 };
+			btVector3 linearLower{ 0, 0, 0 };
+			btVector3 linearUpper{ 0, 0, 0 };
+			btVector3 angularLower{ 0, 0, 0 };
+			btVector3 angularUpper{ 0, 0, 0 };
+			btVector3 linearNonHookeanStiffness{ 0, 0, 0 };
+			btVector3 angularNonHookeanStiffness{ 0, 0, 0 };
+			btVector3 linearNonHookeanDamping{ 0, 0, 0 };
+			btVector3 angularNonHookeanDamping{ 0, 0, 0 };
+
+			bool operator==(const LiveConstraintParameters&) const = default;
 		};
 
-		struct LiveGTLink
+		struct LiveConstraint
 		{
 			std::string bodyA;
 			std::string bodyB;
 			std::string preset;
-			LiveGTSprings springs;
+			LiveConstraintParameters parameters;
 			bool reversed = false;
 			bool linearEnabled = true;
 			bool angularEnabled = true;
 			bool limitLinearStiffness = true;
 			bool limitAngularStiffness = true;
 			bool limitDamping = true;
+			bool linearMotors = false;
+			bool angularMotors = false;
+			bool linearServos = false;
+			bool angularServos = false;
 
-			bool matches(const LiveGTLink& target) const;
+			bool matches(const LiveConstraint& target) const;
+		};
+
+		struct LiveBoneGravity
+		{
+			std::string bone;
+			std::string preset;
+			float factor;
+		};
+
+		struct LiveProfile
+		{
+			std::vector<LiveConstraint> constraints;
+			std::vector<LiveBoneGravity> gravity;
 		};
 
 		// The accepted target and transition belong to this specific system.
 		// Call these methods under the simulation lock.
-		bool blendGTSprings(const std::vector<LiveGTLink>& target, std::string path, float seconds);
-		const std::string& liveGTTarget() const { return m_liveGTTarget; }
+		bool blendLiveProfile(const LiveProfile& target, std::string path, float seconds);
+		const std::string& liveTarget() const { return m_liveTarget; }
 
 		const std::vector<RE::BSTSmartPointer<SkinnedMeshBody>>& meshes() const { return m_meshes; }
 
@@ -75,24 +109,41 @@ namespace hdt
 		btQuaternion m_lastRootRotation;
 
 	private:
-		struct AttachedGTLink
+		struct AttachedLiveConstraint
 		{
-			LiveGTLink source;
+			LiveConstraint source;
 			Generic6DofConstraint* constraint = nullptr;  // Owned by this system's constraint lists.
 		};
 
-		struct LerpGTLink
+		struct LiveConstraintTransition
 		{
 			Generic6DofConstraint* constraint;
-			LiveGTSprings start;
-			LiveGTSprings target;
+			LiveConstraintParameters start;
+			LiveConstraintParameters target;
 		};
 
-		std::vector<AttachedGTLink> m_attachedGTLinks;
-		std::vector<LerpGTLink> m_lerpGTLinks;
-		std::string m_liveGTTarget;
-		float m_liveGTElapsed = 0;
-		float m_liveGTDuration = 0;
+		struct AttachedLiveBone
+		{
+			std::string name;
+			std::string preset;
+			SkinnedMeshBone* bone;  // Owned by this system's bone list.
+		};
+
+		struct LiveGravityTransition
+		{
+			SkinnedMeshBone* bone;
+			float start;
+			float target;
+		};
+
+		LiveProfileKind m_liveProfileKind = LiveProfileKind::None;
+		std::vector<AttachedLiveConstraint> m_liveConstraints;
+		std::vector<AttachedLiveBone> m_liveBones;
+		std::vector<LiveConstraintTransition> m_liveConstraintTransitions;
+		std::vector<LiveGravityTransition> m_liveGravityTransitions;
+		std::string m_liveTarget;
+		float m_liveElapsed = 0;
+		float m_liveDuration = 0;
 	};
 
 	class XMLReader;
@@ -100,9 +151,15 @@ namespace hdt
 	class SkyrimSystemCreator
 	{
 	public:
+		struct LiveProfileFamily
+		{
+			LiveProfileKind kind = LiveProfileKind::None;
+			std::string key;
+		};
+
 		SkyrimSystemCreator();
-		static std::string liveGTProfileFamily(std::string_view path);
-		std::optional<std::vector<SkyrimSystem::LiveGTLink>> readLiveGTProfile(const std::string& path);
+		static LiveProfileFamily liveProfileFamily(std::string_view path);
+		std::optional<SkyrimSystem::LiveProfile> readLiveProfile(const std::string& path, LiveProfileKind kind);
 
 		RE::BSTSmartPointer<SkyrimSystem> createOrUpdateSystem(RE::NiNode* skeleton, RE::NiAVObject* model, DefaultBBP::PhysicsFile_t* file, std::unordered_map<RE::BSFixedString, RE::BSFixedString>&& renameMap, SkyrimSystem* old_system);
 
@@ -238,7 +295,6 @@ namespace hdt
 		SkyrimBone* getOrCreateBone(const RE::BSFixedString& name);
 
 		std::string m_filePath;
-		bool m_collectLiveGTLinks = false;
 
 		std::unordered_map<RE::BSFixedString, BoneTemplate> m_boneTemplates;
 		std::unordered_map<RE::BSFixedString, GenericConstraintTemplate> m_genericConstraintTemplates;
@@ -268,7 +324,8 @@ namespace hdt
 		RE::BSTSmartPointer<SkyrimBody> readPerVertexShape(DefaultBBP::NameMap_t meshNameMap);
 		RE::BSTSmartPointer<SkyrimBody> readPerTriangleShape(DefaultBBP::NameMap_t* meshNameMap);
 		RE::BSTSmartPointer<Generic6DofConstraint> readGenericConstraint();
-		static void readLiveGTLinkSettings(SkyrimSystem::LiveGTLink& link, const GenericConstraintTemplate& values);
+		static void readLiveConstraintSettings(SkyrimSystem::LiveConstraint& link, const GenericConstraintTemplate& values,
+			bool includeNonHookean);
 		RE::BSTSmartPointer<StiffSpringConstraint> readStiffSpringConstraint();
 		RE::BSTSmartPointer<ConeTwistConstraint> readConeTwistConstraint();
 		RE::BSTSmartPointer<ConstraintGroup> readConstraintGroup();

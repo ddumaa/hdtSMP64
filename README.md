@@ -1,16 +1,30 @@
 # Faster HDT-SMP (FSMP)
 
-## Shape Physics GT Live SMP QA
+## Shape Physics – Smooth SMP Transitions
 
-This fork contains the Shape Physics experimental patch for FSMP 4.1.1. The patch was added on November 24, 2026 and is based on the [official 4.1.1 build commit](https://github.com/DaymareOn/hdtSMP64/commit/2215ec3ba09adf0843a3291ed0437a6ca6d385e2).
+QA4 adds smooth transitions for **GT SMP** and **3BA SMP** to FSMP 4.1.1. When the player's automatic Shape Physics preset changes within the same compatible XML family, FSMP blends the new parameters over half a second in the running simulation. It keeps the existing model, physics system, and velocities. [FSMP 4.1.1 build commit](https://github.com/DaymareOn/hdtSMP64/commit/2215ec3ba09adf0843a3291ed0437a6ca6d385e2)
 
-When Shape Physics requests a compatible GT profile for the same attached body, FSMP blends chest spring stiffness and damping in the running simulation. It keeps the same physics system, pose, and bone velocities. The source XML provides the new spring values. Shape Physics requests a half-second transition during automatic shape-based updates.
+- **GT SMP** blends spring stiffness, damping, and compatible travel limits for the main body and the slot 60 auxiliary system.
+- **3BA SMP** blends the same spring parameters and travel limits, plus nonlinear spring coefficients and chest bone gravity. A full SMP profile can cover the chest, glutes, abdomen, and thighs. With a mixed setup, each zone follows its active physics engine.
 
-This QA build targets the player's GT body with the automatic Shape Physics profile active. Its scope is linear and angular spring stiffness and damping. The local AVX build passed the XML validator and Skyrim AE 1.6.1170 reached the main menu with it loaded. In-game motion testing is pending.
+The first attachment and changes to a different profile family use the usual XML load. The integration uses the existing Shape Physics morph scores and regional XML generator. The local QA4 AVX build targeted Skyrim AE 1.6.1170 and passed three FSMP test suites. The XML comparisons covered 298 profiles. In-game QA4 motion testing is pending.
 
-The archive from the QA workflow contains the replacement `hdtsmp64.dll`, the source commit, a SHA-256 checksum, and the FSMP license texts. A game test also needs the paired Shape Physics QA scripts and the original FSMP installation with its dependencies. The Shape Physics integration will be available on Nexus after the in-game check. [GitHub Actions](https://github.com/ddumaa/hdtSMP64/actions/workflows/shape-physics-gt-live.yml)
+### Source and build
 
-The modified FSMP code is distributed under GPLv3 with the upstream exceptions. [License](LICENSE) · [Exceptions](EXCEPTIONS)
+The native changes are in `src`. The paired Papyrus sources include the bridge declarations and the patch against the exact pre-Live Photo controller. The bridge reports API version 3. [Papyrus bridge](shape-physics/qa4/Scripts/Source/ShapePhysicsLive.psc) · [Controller patch](shape-physics/qa4/ShapePhysicsUnified.patch) · [Controller baseline](shape-physics/qa4/README.md)
+
+Use Visual Studio 2022, CMake, and vcpkg with `VCPKG_ROOT` pointing to your vcpkg installation. Run these commands from the fork's root in PowerShell.
+
+```powershell
+git submodule update --init --recursive
+$pluginRoot = Join-Path (Get-Location).Path 'out/build/vs2022-windows-avx/plugins'
+New-Item -ItemType Directory -Force -Path (Join-Path $pluginRoot 'SKSE/Plugins') | Out-Null
+cmake --preset vs2022-windows-avx "-DCompiledPluginsPath=$pluginRoot" -DPROJECT_BUILD_INFO=shape-physics-live-smp-qa4 -DBUILD_VALIDATOR_TESTS=ON -DBUILD_PATTERN_TESTS=ON -DBUILD_CONFIG_TESTS=ON
+cmake --build out/build/vs2022-windows-avx --config Release
+ctest --test-dir out/build/vs2022-windows-avx -C Release --output-on-failure --no-tests=error
+```
+
+Use the resulting DLL with the matching Shape Physics scripts, the original FSMP installation and its runtime dependencies. The modified FSMP code is distributed under GPLv3 with the upstream exceptions. [License](LICENSE) · [Exceptions](EXCEPTIONS) · [Earlier GT-only QA1](https://github.com/ddumaa/hdtSMP64/tree/shape-physics-gt-live-qa1)
 
 ## Upstream FSMP
 
