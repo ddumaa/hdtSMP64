@@ -74,7 +74,14 @@ jobs:
           $destination = Join-Path 'artifacts' $relativeDll
           New-Item -ItemType Directory -Force -Path (Split-Path -Parent $destination) | Out-Null
           Copy-Item -LiteralPath $dll -Destination $destination
-          Copy-Item -LiteralPath 'LICENSE', 'EXCEPTIONS' -Destination 'artifacts'
+          $notices = @(
+              'LICENSE',
+              'EXCEPTIONS',
+              'fomod tree/DearImGuiLicense.txt',
+              'fomod tree/DynamicHDTOriginalWorkLicense.txt',
+              'fomod tree/SKSEMenuFrameworkLicense.txt'
+          )
+          Copy-Item -LiteralPath $notices -Destination 'artifacts'
           $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $destination).Hash.ToLowerInvariant()
           "$hash  $relativeDll" | Set-Content -Encoding ascii -LiteralPath 'artifacts/SHA256SUMS.txt'
           $env:GITHUB_SHA | Set-Content -Encoding ascii -LiteralPath 'artifacts/BUILD-COMMIT.txt'
