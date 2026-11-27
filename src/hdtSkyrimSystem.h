@@ -8,6 +8,7 @@
 #include "hdtSkinnedMesh/hdtStiffSpringConstraint.h"
 #include "hdtSkyrimBody.h"
 #include "hdtSkyrimBone.h"
+#include <array>
 #include <optional>
 #include <string_view>
 
@@ -110,6 +111,14 @@ namespace hdt
 		const std::string& liveTarget() const { return m_liveTarget; }
 		const std::string& liveAppliedTarget() const { return m_liveAppliedTarget; }
 
+		// Regular GT has these same source bones in both automatic modes.
+		static constexpr std::array gtMotionNames{ "Soft_LN00", "Soft_L102", "Soft_L502",
+			"Soft_RN00", "Soft_R102", "Soft_R502" };
+		const auto& gtMotionBones() const { return m_gtMotionBones; }
+		std::string_view gtMotionXml() const { return m_liveAppliedTarget.empty() ? m_gtMotionXml : m_liveAppliedTarget; }
+		bool gtMotionGeometry() const { return m_liveGeometryGT; }
+		bool gtMotionBlending() const { return m_liveTarget != m_liveAppliedTarget; }
+
 		const std::vector<RE::BSTSmartPointer<SkinnedMeshBody>>& meshes() const { return m_meshes; }
 
 		RE::NiPointer<RE::NiNode> m_skeleton;
@@ -165,6 +174,8 @@ namespace hdt
 		std::vector<LiveMassTransition> m_liveMassTransitions;
 		std::string m_liveTarget;
 		std::string m_liveAppliedTarget;
+		std::array<SkyrimBone*, gtMotionNames.size()> m_gtMotionBones{};
+		std::string m_gtMotionXml;
 		float m_liveElapsed = 0;
 		float m_liveDuration = 0;
 	};

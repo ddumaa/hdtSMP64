@@ -1034,6 +1034,17 @@ namespace hdt
 		}
 
 		m_mesh->m_skeleton = hdt::make_nismart(m_skeleton);
+		std::array<SkyrimBone*, SkyrimSystem::gtMotionNames.size()> motionBones{};
+		for (size_t i = 0; i < motionBones.size(); ++i) {
+			auto* bone = findBoneFromIndex(getRenamedBone(SkyrimSystem::gtMotionNames[i]));
+			if (!bone || bone->m_rig.isStaticOrKinematicObject())
+				break;
+			motionBones[i] = bone;
+		}
+		if (motionBones.back()) {
+			m_mesh->m_gtMotionBones = motionBones;
+			m_mesh->m_gtMotionXml = path;
+		}
 		m_mesh->m_shapeRefs.swap(m_shapeRefs);
 		std::sort(m_mesh->m_bones.begin(), m_mesh->m_bones.end(), [](const auto& a, const auto& b) {
 			return static_cast<SkyrimBone*>(a.get())->m_depth < static_cast<SkyrimBone*>(b.get())->m_depth;

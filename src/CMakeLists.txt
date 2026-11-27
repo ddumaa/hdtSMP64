@@ -72,6 +72,8 @@ set(SOURCE_FILES
 	"${SOURCE_DIR}/ActorManager.h"
 	"${SOURCE_DIR}/hdtSkyrimPhysicsWorld.cpp"
 	"${SOURCE_DIR}/hdtSkyrimPhysicsWorld.h"
+	"${SOURCE_DIR}/GTMotionCapture.cpp"
+	"${SOURCE_DIR}/GTMotionCapture.h"
 	"${SOURCE_DIR}/hdtPhysicsProfiler.cpp"
 	"${SOURCE_DIR}/hdtPhysicsProfiler.h"
 	"${SOURCE_DIR}/hdtDefaultBBP.cpp"

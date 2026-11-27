@@ -1,4 +1,5 @@
 #include "hdtSkyrimPhysicsWorld.h"
+#include "GTMotionCapture.h"
 #include "PluginInterfaceImpl.h"
 #include "WeatherManager.h"
 #include "hdtPhysicsProfiler.h"
@@ -367,6 +368,16 @@ namespace hdt
 
 	RE::BSEventNotifyControl SkyrimPhysicsWorld::ProcessEvent(const Events::FrameSyncEvent*, RE::BSTEventSource<Events::FrameSyncEvent>*)
 	{
+		const auto publishTransforms = [this] {
+			GTMotionCapture::pollControls(!m_suspended && !m_loading);
+			if (m_pendingTransformUpdate) {
+				std::lock_guard<decltype(m_lock)> l(m_lock);
+				writeTransform();
+				if (GTMotionCapture::active())
+					GTMotionCapture::sample(m_systems);
+				m_pendingTransformUpdate = false;
+			}
+		};
 		if (m_doMetrics) {
 			LARGE_INTEGER ticks, freq;
 			QueryPerformanceCounter(&ticks);
@@ -377,11 +388,7 @@ namespace hdt
 			QueryPerformanceCounter(&ticks);
 			int64_t t1 = ticks.QuadPart;
 
-			if (m_pendingTransformUpdate) {
-				std::lock_guard<decltype(m_lock)> l(m_lock);
-				writeTransform();
-				m_pendingTransformUpdate = false;
-			}
+			publishTransforms();
 
 			QueryPerformanceCounter(&ticks);
 			int64_t t2 = ticks.QuadPart;
@@ -424,18 +431,17 @@ namespace hdt
 				avgTotalCpuWork);
 		} else {
 			m_tasks.wait();
-			if (m_pendingTransformUpdate) {
-				std::lock_guard<decltype(m_lock)> l(m_lock);
-				writeTransform();
-				m_pendingTransformUpdate = false;
-			}
+			publishTransforms();
 		}
+		GTMotionCapture::flush();
 
 		return RE::BSEventNotifyControl::kContinue;
 	}
 
 	RE::BSEventNotifyControl SkyrimPhysicsWorld::ProcessEvent(const Events::ShutdownEvent*, RE::BSTEventSource<Events::ShutdownEvent>*)
 	{
+		GTMotionCapture::finish();
+		GTMotionCapture::flush(false);
 		while (m_systems.size()) {
 			SkinnedMeshWorld::removeSkinnedMeshSystem(m_systems.back().get());
 		}
