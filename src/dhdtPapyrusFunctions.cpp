@@ -48,7 +48,7 @@ namespace
 		return 3;
 	}
 
-	template <LiveProfileKind Kind>
+	template <LiveProfileKind Kind, bool Applied = false>
 	RE::BSFixedString getLiveTarget(RE::StaticFunctionTag*, RE::Actor* actor, RE::TESObjectARMA* addon)
 	{
 		if (!actor || !addon)
@@ -59,6 +59,8 @@ namespace
 		if (!current.system)
 			return "";
 		auto simulation = hdt::SkyrimPhysicsWorld::get()->lockSimulation();
+		if constexpr (Applied)
+			return current.system->liveAppliedTarget().c_str();
 		return current.system->liveTarget().c_str();
 	}
 
@@ -134,6 +136,7 @@ bool RegisterFuncs(RE::BSScript::IVirtualMachine* registry)
 	registry->RegisterFunction("ResetPhysics", "DynamicHDT", hdt::papyrus::ResetPhysics);
 	registry->RegisterFunction("GetVersion", "ShapePhysicsLive", shapePhysicsLiveVersion);
 	registry->RegisterFunction("GetTargetGT", "ShapePhysicsLive", getLiveTarget<LiveProfileKind::GT>);
+	registry->RegisterFunction("GetAppliedTargetGT", "ShapePhysicsLive", getLiveTarget<LiveProfileKind::GT, true>);
 	registry->RegisterFunction("BlendGT", "ShapePhysicsLive", blendLiveTarget<LiveProfileKind::GT>);
 	registry->RegisterFunction("GetTarget3BA", "ShapePhysicsLive", getLiveTarget<LiveProfileKind::ThreeBA>);
 	registry->RegisterFunction("Blend3BA", "ShapePhysicsLive", blendLiveTarget<LiveProfileKind::ThreeBA>);

@@ -52,6 +52,7 @@ namespace hdt
 			btVector3 linearUpper{ 0, 0, 0 };
 			btVector3 angularLower{ 0, 0, 0 };
 			btVector3 angularUpper{ 0, 0, 0 };
+			btVector3 linearEquilibrium{ 0, 0, 0 };
 			btVector3 linearNonHookeanStiffness{ 0, 0, 0 };
 			btVector3 angularNonHookeanStiffness{ 0, 0, 0 };
 			btVector3 linearNonHookeanDamping{ 0, 0, 0 };
@@ -87,16 +88,27 @@ namespace hdt
 			float factor;
 		};
 
+		struct LiveMassProperties
+		{
+			float mass;
+			btVector3 inertia;
+			btVector3 center;
+
+			bool operator==(const LiveMassProperties&) const = default;
+		};
+
 		struct LiveProfile
 		{
 			std::vector<LiveConstraint> constraints;
 			std::vector<LiveBoneGravity> gravity;
+			std::vector<LiveMassProperties> mass;
 		};
 
 		// The accepted target and transition belong to this specific system.
 		// Call these methods under the simulation lock.
 		bool blendLiveProfile(const LiveProfile& target, std::string path, float seconds);
 		const std::string& liveTarget() const { return m_liveTarget; }
+		const std::string& liveAppliedTarget() const { return m_liveAppliedTarget; }
 
 		const std::vector<RE::BSTSmartPointer<SkinnedMeshBody>>& meshes() const { return m_meshes; }
 
@@ -136,12 +148,23 @@ namespace hdt
 			float target;
 		};
 
+		struct LiveMassTransition
+		{
+			SkinnedMeshBone* bone;
+			LiveMassProperties start;
+			LiveMassProperties target;
+			std::vector<btTransform*> frames;
+		};
+
 		LiveProfileKind m_liveProfileKind = LiveProfileKind::None;
+		bool m_liveGeometryGT = false;
 		std::vector<AttachedLiveConstraint> m_liveConstraints;
 		std::vector<AttachedLiveBone> m_liveBones;
 		std::vector<LiveConstraintTransition> m_liveConstraintTransitions;
 		std::vector<LiveGravityTransition> m_liveGravityTransitions;
+		std::vector<LiveMassTransition> m_liveMassTransitions;
 		std::string m_liveTarget;
+		std::string m_liveAppliedTarget;
 		float m_liveElapsed = 0;
 		float m_liveDuration = 0;
 	};
@@ -325,7 +348,7 @@ namespace hdt
 		RE::BSTSmartPointer<SkyrimBody> readPerTriangleShape(DefaultBBP::NameMap_t* meshNameMap);
 		RE::BSTSmartPointer<Generic6DofConstraint> readGenericConstraint();
 		static void readLiveConstraintSettings(SkyrimSystem::LiveConstraint& link, const GenericConstraintTemplate& values,
-			bool includeNonHookean);
+			bool includeNonHookean, bool includeEquilibrium);
 		RE::BSTSmartPointer<StiffSpringConstraint> readStiffSpringConstraint();
 		RE::BSTSmartPointer<ConeTwistConstraint> readConeTwistConstraint();
 		RE::BSTSmartPointer<ConstraintGroup> readConstraintGroup();

@@ -5,6 +5,7 @@
 QA4 adds smooth transitions for **GT SMP** and **3BA SMP** to FSMP 4.1.1. When the player's automatic Shape Physics preset changes within the same compatible XML family, FSMP blends the new parameters over half a second in the running simulation. It keeps the existing model, physics system, and velocities. [FSMP 4.1.1 build commit](https://github.com/DaymareOn/hdtSMP64/commit/2215ec3ba09adf0843a3291ed0437a6ca6d385e2)
 
 - **GT SMP** blends spring stiffness, damping, and compatible travel limits for the main body and the slot 60 auxiliary system.
+- **Geometry GT** also blends per-bone mass, inertia, center of mass, and spring preload for compatible `gmr3_` profiles. The controller can query the last applied target after the transition finishes.
 - **3BA SMP** blends the same spring parameters and travel limits, plus nonlinear spring coefficients and chest bone gravity. A full SMP profile can cover the chest, glutes, abdomen, and thighs. With a mixed setup, each zone follows its active physics engine.
 
 The first attachment and changes to a different profile family use the usual XML load. The integration uses the existing Shape Physics morph scores and regional XML generator. The local QA4 AVX build targeted Skyrim AE 1.6.1170 and passed three FSMP test suites. The XML comparisons covered 298 profiles. In-game QA4 motion testing is pending.
@@ -20,7 +21,7 @@ git submodule update --init --recursive
 $pluginRoot = Join-Path (Get-Location).Path 'out/build/vs2022-windows-avx/plugins'
 New-Item -ItemType Directory -Force -Path (Join-Path $pluginRoot 'SKSE/Plugins') | Out-Null
 cmake --preset vs2022-windows-avx "-DCompiledPluginsPath=$pluginRoot" -DPROJECT_BUILD_INFO=shape-physics-live-smp-qa4 -DBUILD_VALIDATOR_TESTS=ON -DBUILD_PATTERN_TESTS=ON -DBUILD_CONFIG_TESTS=ON
-cmake --build out/build/vs2022-windows-avx --config Release
+cmake --build out/build/vs2022-windows-avx --clean-first --config Release
 ctest --test-dir out/build/vs2022-windows-avx -C Release --output-on-failure --no-tests=error
 ```
 

@@ -10,3 +10,5 @@ Apply the patch to the `Scripts/Source/ShapePhysicsUnified.psc` from the Shape P
 | QA4 after applying the patch | `f100672cd98c79e6eb18e3ce4296eb08f10fa17c8996d843ad06d8a7c0b3e68b` |
 
 Normalize the baseline file to LF, then run `git -c core.autocrlf=false apply /path/to/ShapePhysicsUnified.patch` from the directory that contains `Scripts`. Compile the patched controller and bridge together with the Shape Physics Papyrus build inputs.
+
+For geometry-based GT, use the Geometry GT controller from Shape Physics `develop`, the native DLL from the same build, and the paired `SKSE/Plugins/ShapePhysicsLiveGTGeometry.ini` marker. `GetAppliedTargetGT` returns the target after it has been applied to the running system.

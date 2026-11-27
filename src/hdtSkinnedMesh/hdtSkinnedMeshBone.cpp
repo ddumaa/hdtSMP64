@@ -20,7 +20,9 @@ namespace hdt
 
 	void SkinnedMeshBone::internalUpdate()
 	{
-		auto t = m_rigToLocal * m_rig.getInterpolationWorldTransform();
+		const auto& rig = m_rig.getInterpolationWorldTransform();
+		// Geometry GT centers are authored in bone space, as in SkyrimBone::writeTransform.
+		auto t = m_localCollisionCenter ? rig * m_rigToLocal : m_rigToLocal * rig;
 		m_currentTransform.setBasis(t.getBasis());
 		m_currentTransform.setOrigin(t.getOrigin());
 	}

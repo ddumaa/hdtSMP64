@@ -25,6 +25,7 @@ namespace hdt
 		btRigidBody m_rig;
 		btTransform m_localToRig;
 		btTransform m_rigToLocal;
+		bool m_localCollisionCenter = false;
 		btQsTransform m_currentTransform;
 
 		std::vector<RE::BSFixedString> m_canCollideWithBone;
