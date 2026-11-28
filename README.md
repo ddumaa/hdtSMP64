@@ -9,6 +9,12 @@ QA4 adds smooth transitions for **GT SMP** and **3BA SMP** to FSMP 4.1.1. When t
 
 The first attachment and changes to a different profile family use the usual XML load. The integration uses the existing Shape Physics morph scores and regional XML generator. The local QA4 AVX build targeted Skyrim AE 1.6.1170 and passed three FSMP test suites. The XML comparisons covered 298 profiles. In-game QA4 motion testing is pending.
 
+### Pair with Shape Physics In-Game Geometry QA
+
+Use the In-Game Geometry QA add-on with the In-Game Geometry QA main package from Shape Physics commit `1123f3f`. The add-on contains the QA4 native DLL and bridge API v3, with its Papyrus controller adapted for in-game body measurement. Install the add-on after the main package in MO2 so its controller takes priority. [Main package](https://github.com/ddumaa/shape-physics/blob/1123f3fe3ef0d29a4eb8a5b063313fe042ef5fb0/outputs/Shape%20Physics%201.1.0%20-%20In-Game%20Geometry%20QA.zip) · [Add-on package](https://github.com/ddumaa/shape-physics/blob/1123f3fe3ef0d29a4eb8a5b063313fe042ef5fb0/outputs/Shape%20Physics%20-%20Smooth%20SMP%20Transitions%20-%20In-Game%20Geometry%20QA.zip)
+
+To rebuild the pair, use the Shape Physics archive builder with the Photo Physics QA main archive and pass its matching Photo Physics QA add-on through `--smooth` and the destination through `--smooth-output`. The builder adapts and compiles both controllers while retaining the native DLL from the add-on. [Archive builder](https://github.com/ddumaa/shape-physics/blob/1123f3fe3ef0d29a4eb8a5b063313fe042ef5fb0/qa/runtime-geometry/Build-Runtime-Geometry-Archive.py)
+
 ### Source and build
 
 The native changes are in `src`. The paired Papyrus sources include the bridge declarations and the patch against the exact pre-Live Photo controller. The bridge reports API version 3. [Papyrus bridge](shape-physics/qa4/Scripts/Source/ShapePhysicsLive.psc) · [Controller patch](shape-physics/qa4/ShapePhysicsUnified.patch) · [Controller baseline](shape-physics/qa4/README.md)
