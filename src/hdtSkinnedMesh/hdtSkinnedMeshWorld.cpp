@@ -1,4 +1,5 @@
 #include "hdtSkinnedMeshWorld.h"
+#include "GTMotionCapture.h"
 #include "hdtBoneScaleConstraint.h"
 #include "hdtDispatcher.h"
 #include "hdtSkinnedMeshAlgorithm.h"
@@ -152,9 +153,17 @@ namespace hdt
 		applyGravity();
 		if (hdt::SkyrimPhysicsWorld::get()->m_enableWind)
 			applyWind(remainingTimeStep);
+		const bool trace = GTMotionCapture::tracingFrame();
+		const auto substep = [this, trace](btScalar dt) {
+			if (trace)
+				GTMotionCapture::beginSubstep(dt, getSolverInfo().m_numIterations);
+			internalSingleStepSimulation(dt);
+			if (trace)
+				GTMotionCapture::endSubstep();
+		};
 
 		while (remainingTimeStep > fixedTimeStep) {
-			internalSingleStepSimulation(fixedTimeStep);
+			substep(fixedTimeStep);
 			remainingTimeStep -= fixedTimeStep;
 		}
 
@@ -166,7 +175,7 @@ namespace hdt
 		// (appearing more stiff or damping differently at various framerates).
 		constexpr auto minPossiblePeriod = 1.0f / 300.0f;
 		if (remainingTimeStep > minPossiblePeriod)
-			internalSingleStepSimulation(remainingTimeStep);
+			substep(remainingTimeStep);
 		clearForces();
 
 		_bodies.clear();
@@ -436,6 +445,8 @@ namespace hdt
 		}
 
 		btDiscreteDynamicsWorldMt::solveConstraints(solverInfo);
+		if (GTMotionCapture::tracingFrame())
+			GTMotionCapture::sampleLimits();
 
 		// the HDT manifolds are still recreated every frame, clear to prevent stale data.
 		static_cast<CollisionDispatcher*>(m_dispatcher1)->clearAllManifold();

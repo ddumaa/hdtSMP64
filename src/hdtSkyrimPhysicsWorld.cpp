@@ -154,6 +154,8 @@ namespace hdt
 			BT_PROFILE("HDTSMP_doUpdate2ndStep");
 			updateActiveState();
 			auto offset = applyTranslationOffset();
+			if (GTMotionCapture::active())
+				GTMotionCapture::beginFrame(m_systems, m_constraints, offset);
 			stepSimulation(remainingTimeStep, 0, tick);
 			restoreTranslationOffset(offset);
 			m_accumulatedInterval = 0;
@@ -440,13 +442,12 @@ namespace hdt
 
 	RE::BSEventNotifyControl SkyrimPhysicsWorld::ProcessEvent(const Events::ShutdownEvent*, RE::BSTEventSource<Events::ShutdownEvent>*)
 	{
+		m_tasks.wait();
 		GTMotionCapture::finish();
 		GTMotionCapture::flush(false);
 		while (m_systems.size()) {
 			SkinnedMeshWorld::removeSkinnedMeshSystem(m_systems.back().get());
 		}
-
-		m_tasks.wait();
 
 		return RE::BSEventNotifyControl::kContinue;
 	}

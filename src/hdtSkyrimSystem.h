@@ -9,11 +9,13 @@
 #include "hdtSkyrimBody.h"
 #include "hdtSkyrimBone.h"
 #include <array>
+#include <memory>
 #include <optional>
 #include <string_view>
 
 namespace hdt
 {
+	struct GTStandingReferenceJob;
 	enum class LiveProfileKind { None, GT, ThreeBA };
 
 	inline const char* liveProfileName(LiveProfileKind kind)
@@ -78,6 +80,8 @@ namespace hdt
 			bool angularMotors = false;
 			bool linearServos = false;
 			bool angularServos = false;
+			int frameType = 0;
+			btTransform authoredFrame = btTransform::getIdentity();
 
 			bool matches(const LiveConstraint& target) const;
 		};
@@ -103,6 +107,7 @@ namespace hdt
 			std::vector<LiveConstraint> constraints;
 			std::vector<LiveBoneGravity> gravity;
 			std::vector<LiveMassProperties> mass;
+			bool uniformGTTissue = false;
 		};
 
 		// The accepted target and transition belong to this specific system.
@@ -115,9 +120,15 @@ namespace hdt
 		static constexpr std::array gtMotionNames{ "Soft_LN00", "Soft_L102", "Soft_L502",
 			"Soft_RN00", "Soft_R102", "Soft_R502" };
 		const auto& gtMotionBones() const { return m_gtMotionBones; }
+		static constexpr size_t gtTraceAnchorCount = 16;
+		static constexpr size_t gtTraceBoneCount = gtTraceAnchorCount + 50;
+		static const std::array<std::string, gtTraceBoneCount>& gtTraceBoneNames();
+		const auto& gtTraceBones() const { return m_gtTraceBones; }
 		std::string_view gtMotionXml() const { return m_liveAppliedTarget.empty() ? m_gtMotionXml : m_liveAppliedTarget; }
 		bool gtMotionGeometry() const { return m_liveGeometryGT; }
-		bool gtMotionBlending() const { return m_liveTarget != m_liveAppliedTarget; }
+		float gtMotionBlendElapsed() const { return m_liveElapsed; }
+		float gtMotionBlendDuration() const { return m_liveDuration; }
+		bool gtMotionBlending() const { return m_liveTarget != m_liveAppliedTarget || m_gtStandingJob || m_gtProgressiveTransition; }
 
 		const std::vector<RE::BSTSmartPointer<SkinnedMeshBody>>& meshes() const { return m_meshes; }
 
@@ -165,6 +176,25 @@ namespace hdt
 			std::vector<btTransform*> frames;
 		};
 
+		struct GTReferenceLink
+		{
+			size_t attachment;
+			size_t bodyA, bodyB;
+			btTransform frameA, frameB;
+			int stage; // -1 for links that only participate in the standing solve.
+		};
+
+		struct GTProgressiveReference
+		{
+			float sigma = 0;
+			float standing = 0;
+		};
+
+		bool queueGTStandingReference(const LiveProfile* target = nullptr);
+		void applyGTStandingReference(float weight);
+		void clearGTStandingReference();
+		bool prepareGTStandingReference();
+
 		LiveProfileKind m_liveProfileKind = LiveProfileKind::None;
 		bool m_liveGeometryGT = false;
 		std::vector<AttachedLiveConstraint> m_liveConstraints;
@@ -175,6 +205,17 @@ namespace hdt
 		std::string m_liveTarget;
 		std::string m_liveAppliedTarget;
 		std::array<SkyrimBone*, gtMotionNames.size()> m_gtMotionBones{};
+		std::array<SkyrimBone*, gtTraceBoneCount> m_gtTraceBones{};
+		std::array<btQsTransform, gtTraceBoneCount> m_gtReferenceBones;
+		std::vector<GTReferenceLink> m_gtReferenceLinks;
+		std::shared_ptr<GTStandingReferenceJob> m_gtStandingJob;
+		static constexpr size_t gtProgressiveCount = 32;
+		std::array<GTProgressiveReference, gtProgressiveCount> m_gtProgressiveStart{};
+		std::array<GTProgressiveReference, gtProgressiveCount> m_gtProgressiveTarget{};
+		std::array<GTProgressiveReference, gtProgressiveCount> m_gtProgressiveCurrent{};
+		float m_gtProgressiveActivation = 0.f;
+		float m_gtProgressiveStartActivation = 0.f;
+		bool m_gtProgressiveTransition = false;
 		std::string m_gtMotionXml;
 		float m_liveElapsed = 0;
 		float m_liveDuration = 0;
@@ -213,6 +254,7 @@ namespace hdt
 
 		void indexBone(SkyrimBone* bone);
 		SkyrimBone* findBoneFromIndex(const RE::BSFixedString& name) const;
+		bool initializeGTStandingReference();
 
 		struct DeferredBuild
 		{

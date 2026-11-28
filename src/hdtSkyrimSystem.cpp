@@ -1,4 +1,5 @@
 #include "hdtSkyrimSystem.h"
+#include "hdtGTStandingReference.h"
 #include "hdtSkinnedMesh/hdtSkinnedMeshShape.h"
 
 #include "HavokUtils.h"
@@ -8,6 +9,7 @@
 #include "hdtSkyrimPhysicsWorld.h"
 #include <array>
 #include <cmath>
+#include <tbb/task_arena.h>
 
 // F16C isn't supported on super old processors. AVX2+ (AVX processors can have it, but not guaranteed)
 #if defined(__AVX2__) || defined(__AVX512F__)
@@ -168,6 +170,11 @@ namespace hdt
 
 		constexpr std::string_view geometryLiveFamily = "gt-geometry";
 		constexpr size_t geometryBoneCount = 50;
+
+		bool usesUniformGTTissue(XMLReader& reader)
+		{
+			return reader.getAttribute("shapePhysicsTissue", "") == "uniform-volume-v1";
+		}
 
 		bool isGeometryMovingBone(std::string_view name)
 		{
@@ -337,6 +344,148 @@ namespace hdt
 		       linearServos == target.linearServos && angularServos == target.angularServos;
 	}
 
+	bool SkyrimSystem::queueGTStandingReference(const LiveProfile* target)
+	{
+		if (m_gtReferenceLinks.empty())
+			return false;
+		auto job = std::make_shared<GTStandingReferenceJob>();
+		job->worldGravity = -9.8f * scaleSkyrim;
+		job->bodies.reserve(m_gtTraceBones.size());
+		job->links.reserve(m_gtReferenceLinks.size());
+		for (size_t i = 0; i < m_gtTraceBones.size(); ++i) {
+			const auto& bone = *m_gtTraceBones[i];
+			const auto& body = bone.m_rig;
+			const auto scale = bone.m_currentTransform.getScale();
+			if (!isSafeLiveScale(scale) || !hasUnrotatedCenter(bone.m_localToRig))
+				return false;
+			auto center = bone.m_localToRig.getOrigin() / scale;
+			auto& input = job->bodies.emplace_back(GTStandingReferenceJob::Body{
+				m_gtReferenceBones[i].asTransform(), btVector3(0, 0, 0), 0.f,
+				body.getLinearDamping(), body.getAngularDamping(), bone.m_gravityFactor });
+			if (i >= gtTraceAnchorCount) {
+				const auto it = std::ranges::find(m_liveBones, &bone, &AttachedLiveBone::bone);
+				if (it == m_liveBones.end())
+					return false;
+				const auto boneIndex = static_cast<size_t>(it - m_liveBones.begin());
+				const auto inv = body.getInvInertiaDiagLocal();
+				const auto scale3 = scale * scale * scale;
+				const auto scale5 = scale3 * scale * scale;
+				if (body.getInvMass() <= 0 || inv.x() <= 0 || inv.y() <= 0 || inv.z() <= 0)
+					return false;
+				const auto value = target ? target->mass[boneIndex] : LiveMassProperties{
+					1.f / (body.getInvMass() * scale3),
+					btVector3(1.f / inv.x(), 1.f / inv.y(), 1.f / inv.z()) / scale5, center };
+				if (!isSafeMass(value))
+					return false;
+				input.mass = value.mass;
+				input.inertia = value.inertia;
+				center = value.center;
+				if (target)
+					input.gravityFactor = target->gravity[boneIndex].factor;
+			}
+			if (!isSafeGravityFactor(input.gravityFactor))
+				return false;
+			input.bind.getOrigin() += input.bind.getBasis() * center;
+		}
+		for (const auto& item : m_gtReferenceLinks) {
+			const auto& attached = m_liveConstraints[item.attachment];
+			const auto& source = target ? target->constraints[item.attachment] : attached.source;
+			const auto& p = source.parameters;
+			if (!isSafeLiveParameters(p) || source.linearMotors || source.angularMotors || source.linearServos || source.angularServos)
+				return false;
+			const auto frame = [&](size_t i, const btTransform& offset) {
+				return job->bodies[i].bind.inverse() * m_gtReferenceBones[i].asTransform() * offset;
+			};
+			auto& link = job->links.emplace_back(GTStandingReferenceJob::Link{ item.bodyA, item.bodyB,
+				frame(item.bodyA, item.frameA), frame(item.bodyB, item.frameB), {}, item.stage });
+			const auto* linear = attached.constraint->getTranslationalLimitMotor();
+			for (int axis = 0; axis < 3; ++axis) {
+				const auto* angular = attached.constraint->getRotationalLimitMotor(axis);
+				link.axes[axis] = { p.linearLower[axis], p.linearUpper[axis], p.linearStiffness[axis], p.linearDamping[axis],
+					p.linearEquilibrium[axis], linear->m_bounce[axis], linear->m_stopERP[axis], linear->m_stopCFM[axis],
+					linear->m_motorERP[axis], linear->m_motorCFM[axis], source.linearEnabled, source.limitLinearStiffness, source.limitDamping };
+				link.axes[axis + 3] = { p.angularLower[axis], p.angularUpper[axis], p.angularStiffness[axis], p.angularDamping[axis],
+					angular->m_equilibriumPoint, angular->m_bounce, angular->m_stopERP, angular->m_stopCFM,
+					angular->m_motorERP, angular->m_motorCFM, source.angularEnabled, source.limitAngularStiffness, source.limitDamping };
+			}
+		}
+		// At most one detached reference rig settles at a time. Queued work whose
+		// owning system detached or took a newer target is skipped before solving.
+		static tbb::task_arena worker(1, 0);
+		m_gtStandingJob = job;
+		worker.enqueue([job] {
+			if (job.use_count() == 1)
+				return;
+			try {
+				if (!job->solve())
+					job->result.clear();
+			} catch (...) {
+				job->result.clear();
+			}
+			job->ready.store(true, std::memory_order_release);
+		});
+		return true;
+	}
+
+	void SkyrimSystem::clearGTStandingReference()
+	{
+		m_gtStandingJob.reset();
+		m_gtProgressiveTransition = false;
+		m_gtProgressiveActivation = 0.f;
+		for (const auto& link : m_gtReferenceLinks)
+			if (link.stage >= 0)
+				m_liveConstraints[link.attachment].constraint->clearProgressiveZ();
+	}
+
+	bool SkyrimSystem::prepareGTStandingReference()
+	{
+		if (!m_gtStandingJob)
+			return true;
+		if (!m_gtStandingJob->ready.load(std::memory_order_acquire))
+			return false;
+		if (m_gtStandingJob->result.size() != gtProgressiveCount) {
+			clearGTStandingReference();
+			logger::warn("[ShapePhysicsLive] GT progressive standing reference could not be solved for {}", m_gtMotionXml);
+			return true;
+		}
+		for (size_t i = 0; i < gtProgressiveCount; ++i) {
+			const auto& ref = m_gtStandingJob->result[i];
+			m_gtProgressiveTarget[i] = { ref.sigma, ref.position };
+		}
+		m_gtStandingJob.reset();
+		m_gtProgressiveStart = m_gtProgressiveActivation > 0.f ? m_gtProgressiveCurrent : m_gtProgressiveTarget;
+		m_gtProgressiveStartActivation = m_gtProgressiveActivation;
+		m_gtProgressiveTransition = true;
+		if (m_liveDuration <= 0.f) {
+			m_liveElapsed = 0.f;
+			m_liveDuration = .25f;
+		}
+		logger::info("[ShapePhysicsLive] GT progressive Z ready ({} radial links, canonical standing) for {}",
+			gtProgressiveCount, m_liveTarget.empty() ? m_gtMotionXml : m_liveTarget);
+		return true;
+	}
+
+	void SkyrimSystem::applyGTStandingReference(float weight)
+	{
+		if (!m_gtProgressiveTransition)
+			return;
+		m_gtProgressiveActivation = std::lerp(m_gtProgressiveStartActivation, 1.f, weight);
+		size_t i = 0;
+		for (const auto& link : m_gtReferenceLinks) {
+			if (link.stage < 0)
+				continue;
+			const auto& start = m_gtProgressiveStart[i];
+			const auto& target = m_gtProgressiveTarget[i];
+			const GTProgressiveReference ref{ std::lerp(start.sigma, target.sigma, weight),
+				std::lerp(start.standing, target.standing, weight) };
+			m_gtProgressiveCurrent[i++] = ref;
+			auto* constraint = m_liveConstraints[link.attachment].constraint;
+			const auto scale = constraint->linearLimitScale();
+			constraint->configureProgressiveZ(scale * ref.sigma, scale * ref.standing, link.stage == 1, m_gtProgressiveActivation);
+		}
+		m_gtProgressiveTransition = weight < 1.f;
+	}
+
 	bool SkyrimSystem::blendLiveProfile(const LiveProfile& target, std::string path, float seconds)
 	{
 		if (m_liveConstraints.empty() || m_liveConstraints.size() != target.constraints.size() ||
@@ -424,9 +573,13 @@ namespace hdt
 			// The ordinary loader can skip a link whose endpoints are absent or kinematic.
 			// Its XML identity must still match; absent runtime constraints are not created.
 			auto* constraint = attached.constraint;
+			if (!constraint && m_liveGeometryGT && target.uniformGTTissue && zone == LiveZone::Chest)
+				return false;
 			if (!constraint)
 				continue;
 			if (!attached.source.matches(goal))
+				return false;
+			if (m_liveGeometryGT && (attached.source.frameType != goal.frameType || !(attached.source.authoredFrame == goal.authoredFrame)))
 				return false;
 
 			const auto linearScale = constraint->linearStiffnessScale();
@@ -470,6 +623,13 @@ namespace hdt
 		}
 		if (matched == 0)
 			return false;
+		if (m_liveGeometryGT && target.uniformGTTissue) {
+			clearGTStandingReference();
+			logger::info("[ShapePhysicsLive] Using GT uniform tissue without progressive Z for target {}", path);
+		} else if (m_liveGeometryGT && !m_gtReferenceLinks.empty() && (keptAxes || !queueGTStandingReference(&target))) {
+			clearGTStandingReference();
+			logger::warn("[ShapePhysicsLive] GT progressive Z unavailable for target {}", path);
+		}
 
 		const auto* profileName = liveProfileName(m_liveProfileKind);
 		logger::info("[ShapePhysicsLive] Accepted {} parameter target {} ({} links changing: chest {}, glutes {}, abdomen {}, thighs {}; {} limit axes held; {} seconds)",
@@ -483,9 +643,14 @@ namespace hdt
 		m_liveMassTransitions = std::move(mass);
 		m_liveElapsed = 0;
 		m_liveDuration = seconds;
-		if (m_liveConstraintTransitions.empty() && m_liveGravityTransitions.empty() && m_liveMassTransitions.empty()) {
+		if (m_liveConstraintTransitions.empty() && m_liveGravityTransitions.empty() && m_liveMassTransitions.empty() &&
+		    !m_gtStandingJob) {
 			m_liveAppliedTarget = m_liveTarget;
 			logger::info("[ShapePhysicsLive] {} parameters already match {}", profileName, m_liveTarget);
+		} else if (m_liveGeometryGT) {
+			// A previously completed destination can be requested again during a reversal.
+			// Its old name no longer describes the currently interpolated coefficients.
+			m_liveAppliedTarget.clear();
 		}
 		return true;
 	}
@@ -493,9 +658,17 @@ namespace hdt
 	void SkyrimSystem::readTransform(float timeStep)
 	{
 		SkinnedMeshSystem::readTransform(timeStep);
-		if (block_resetting || (m_liveConstraintTransitions.empty() && m_liveGravityTransitions.empty() && m_liveMassTransitions.empty()) ||
-		    !std::isfinite(timeStep) || timeStep <= 0)
+		if (block_resetting || !std::isfinite(timeStep) || timeStep <= 0)
 			return;
+		const bool referenceWasPending = static_cast<bool>(m_gtStandingJob);
+		if (referenceWasPending && !prepareGTStandingReference())
+			return;
+		if (m_liveConstraintTransitions.empty() && m_liveGravityTransitions.empty() && m_liveMassTransitions.empty() &&
+		    !m_gtProgressiveTransition) {
+			if (referenceWasPending && m_liveAppliedTarget != m_liveTarget)
+				m_liveAppliedTarget = m_liveTarget;
+			return;
+		}
 
 		// The world holds its simulation mutex here. The base implementation
 		// has already updated bone scales; Bullet has not started its step.
@@ -518,6 +691,7 @@ namespace hdt
 			m_liveConstraintTransitions.clear();
 			m_liveGravityTransitions.clear();
 			m_liveMassTransitions.clear();
+			clearGTStandingReference();
 			logger::warn("[ShapePhysicsLive] Stopped {} parameter transition after an invalid bone scale", liveProfileName(m_liveProfileKind));
 			return;
 		}
@@ -570,12 +744,15 @@ namespace hdt
 			updateBodyMass(*bone.bone, { std::lerp(bone.start.mass, bone.target.mass, weight),
 				bone.start.inertia.lerp(bone.target.inertia, weight),
 				bone.start.center.lerp(bone.target.center, weight) }, bone.frames);
+		applyGTStandingReference(weight);
 		if (progress == 1.f) {
 			m_liveAppliedTarget = m_liveTarget;
 			m_liveConstraintTransitions.clear();
 			m_liveGravityTransitions.clear();
 			m_liveMassTransitions.clear();
-			logger::info("[ShapePhysicsLive] Finished {} parameter transition to {}", liveProfileName(m_liveProfileKind), m_liveTarget);
+			m_liveDuration = 0.f;
+			if (!m_liveTarget.empty())
+				logger::info("[ShapePhysicsLive] Finished {} parameter transition to {}", liveProfileName(m_liveProfileKind), m_liveTarget);
 		}
 	}
 
@@ -657,6 +834,7 @@ namespace hdt
 		SkyrimSystem::LiveProfile profile;
 		const bool is3BA = kind == LiveProfileKind::ThreeBA;
 		const bool geometry = liveProfileFamily(path).key == geometryLiveFamily;
+		profile.uniformGTTissue = geometry && usesUniformGTTissue(reader);
 		std::unordered_map<std::string, float> gravityDefaults;
 		const auto getGravityDefault = [&](const std::string& preset) {
 			auto found = gravityDefaults.find(preset);
@@ -784,7 +962,11 @@ namespace hdt
 		link.parameters = { values.linearStiffness, values.angularStiffness, values.linearDamping, values.angularDamping,
 			values.linearLowerLimit, values.linearUpperLimit, values.angularLowerLimit, values.angularUpperLimit };
 		if (includeEquilibrium)
+		{
 			link.parameters.linearEquilibrium = values.linearEquilibrium;
+			link.frameType = static_cast<int>(values.frameType);
+			link.authoredFrame = values.frame;
+		}
 		if (includeNonHookean) {
 			link.parameters.linearNonHookeanStiffness = values.linearNonHookeanStiffness;
 			link.parameters.angularNonHookeanStiffness = values.angularNonHookeanStiffness;
@@ -900,6 +1082,7 @@ namespace hdt
 		const auto liveFamily = liveProfileFamily(path);
 		m_mesh->m_liveProfileKind = liveFamily.kind;
 		m_mesh->m_liveGeometryGT = liveFamily.key == geometryLiveFamily;
+		const bool uniformGTTissue = m_mesh->m_liveGeometryGT && usesUniformGTTissue(reader);
 		m_boneIndex.clear();
 
 		// This forces the skeleton into a neutral reference pose, which avoids building invalid shape data
@@ -1044,6 +1227,23 @@ namespace hdt
 		if (motionBones.back()) {
 			m_mesh->m_gtMotionBones = motionBones;
 			m_mesh->m_gtMotionXml = path;
+			const auto& names = SkyrimSystem::gtTraceBoneNames();
+			for (size_t i = 0; i < names.size(); ++i) {
+				auto* bone = findBoneFromIndex(getRenamedBone(names[i].c_str()));
+				if (!bone || bone->m_rig.isStaticOrKinematicObject() != (i < SkyrimSystem::gtTraceAnchorCount))
+					break;
+				m_mesh->m_gtTraceBones[i] = bone;
+			}
+		}
+		if (m_mesh->m_liveGeometryGT) {
+			// Keep the bind metadata available for a later blend back to the legacy geometry profile.
+			if (!initializeGTStandingReference() || (!uniformGTTissue && !m_mesh->queueGTStandingReference())) {
+				m_mesh->m_gtReferenceLinks.clear();
+				if (!uniformGTTissue)
+					logger::warn("[ShapePhysicsLive] GT progressive Z disabled: complete canonical Softbody rig unavailable for {}", path);
+			}
+			if (uniformGTTissue)
+				logger::info("[ShapePhysicsLive] Using GT uniform tissue without progressive Z for {}", path);
 		}
 		m_mesh->m_shapeRefs.swap(m_shapeRefs);
 		std::sort(m_mesh->m_bones.begin(), m_mesh->m_bones.end(), [](const auto& a, const auto& b) {
@@ -1057,7 +1257,126 @@ namespace hdt
 			skeleton->Update(updateData);
 		}
 
-		return m_mesh->valid() ? m_mesh : nullptr;
+		if (!m_mesh->valid())
+			return nullptr;
+		if (m_mesh->m_liveGeometryGT && m_mesh->m_liveBones.size() == geometryBoneCount &&
+		    !m_mesh->m_liveConstraints.empty() && std::ranges::all_of(m_mesh->m_liveBones, [](const auto& item) {
+			    return item.bone && !item.bone->m_rig.isStaticOrKinematicObject();
+		    })) {
+			// readConstraint records the XML entry before resolving its Bullet endpoints.
+			// Require every authored chest link, including parallel links with different frames.
+			bool foundChest = false;
+			const bool complete = std::ranges::all_of(m_mesh->m_liveConstraints, [&](const auto& attached) {
+				if (liveZone(attached.source, LiveProfileKind::GT) != LiveZone::Chest)
+					return true;
+				foundChest = true;
+				return attached.constraint != nullptr;
+			});
+			if (foundChest && complete) {
+				m_mesh->m_liveTarget = path;
+				if (!m_mesh->m_gtStandingJob)
+					m_mesh->m_liveAppliedTarget = path;
+			}
+		}
+		return m_mesh;
+	}
+
+	const std::array<std::string, SkyrimSystem::gtTraceBoneCount>& SkyrimSystem::gtTraceBoneNames()
+	{
+		static const auto names = [] {
+			std::array<std::string, gtTraceBoneCount> result;
+			size_t i = 0;
+			for (const char side : { 'L', 'R' })
+				for (int chain = 1; chain <= 8; ++chain)
+					result[i++] = fmt::format("Soft_{}{}00", side, chain);
+			for (const char side : { 'L', 'R' }) {
+				for (int chain = 1; chain <= 8; ++chain)
+					for (int layer = 1; layer <= 3; ++layer)
+						result[i++] = fmt::format("Soft_{}{}0{}", side, chain, layer);
+				result[i++] = fmt::format("Soft_{}N00", side);
+			}
+			return result;
+		}();
+		return names;
+	}
+
+	bool SkyrimSystemCreator::initializeGTStandingReference()
+	{
+		const auto& bones = m_mesh->m_gtTraceBones;
+		if (!bones.back())
+			return false;
+		const auto* shape = castBSTriShape(findObject(m_model, "Softbody"));
+		if (!shape)
+			return false;
+		const auto& instance = shape->GetGeometryRuntimeData().skinInstance;
+		if (!instance || !instance->skinData || !instance->bones)
+			return false;
+		const auto& data = instance->skinData;
+		std::array<bool, SkyrimSystem::gtTraceBoneCount> found{};
+		auto& bind = m_mesh->m_gtReferenceBones;
+		for (uint32_t j = 0; j < data->GetBoneCount(); ++j) {
+			for (size_t i = SkyrimSystem::gtTraceAnchorCount; i < bones.size(); ++i) {
+				if (instance->bones[j] != bones[i]->m_node.get())
+					continue;
+				const auto pose = convertNi(data->GetBoneDataSkinToBone(j)).inverse();
+				if (found[i] || !isSafeLiveScale(pose.getScale()) || btFabs(pose.getScale() - 1.f) > .001f)
+					return false;
+				bind[i] = pose;
+				found[i] = true;
+				break;
+			}
+		}
+		const auto& names = SkyrimSystem::gtTraceBoneNames();
+		for (size_t i = 0; i < SkyrimSystem::gtTraceAnchorCount; ++i) {
+			auto child = names[i];
+			child.back() = '1';
+			const auto it = std::ranges::find(names, child);
+			if (it == names.end())
+				return false;
+			const auto j = static_cast<size_t>(it - names.begin());
+			if (!found[j] || bones[j]->m_node->parent != bones[i]->m_node.get())
+				return false;
+			// The unweighted anchor is the immediate parent of its authored 01
+			// bone. Recover the anchor in skin bind space, without any world pose.
+			bind[i] = bind[j] * convertNi(bones[j]->m_node->local).inverse();
+			if (!isSafeLiveScale(bind[i].getScale()) || btFabs(bind[i].getScale() - 1.f) > .001f)
+				return false;
+			found[i] = true;
+		}
+		if (!std::ranges::all_of(found, [](bool present) { return present; }))
+			return false;
+		std::array<bool, SkyrimSystem::gtProgressiveCount> radial{};
+		auto& links = m_mesh->m_gtReferenceLinks;
+		for (size_t i = 0; i < m_mesh->m_liveConstraints.size(); ++i) {
+			const auto& attached = m_mesh->m_liveConstraints[i];
+			const auto& source = attached.source;
+			const auto a = std::ranges::find(names, source.bodyA);
+			const auto b = std::ranges::find(names, source.bodyB);
+			if (a == names.end() || b == names.end())
+				continue;
+			if (!attached.constraint)
+				return false;
+			const auto ia = static_cast<size_t>(a - names.begin());
+			const auto ib = static_cast<size_t>(b - names.begin());
+			const auto low = std::min((*a)[8], (*b)[8]);
+			const auto high = std::max((*a)[8], (*b)[8]);
+			int stage = -1;
+			if (a->compare(0, 8, *b, 0, 8) == 0 && low >= '1' && high <= '3' && high - low == 1) {
+				stage = low - '1';
+				const auto key = static_cast<size_t>(((*a)[5] == 'R' ? 16 : 0) + ((*a)[6] - '1') * 2 + stage);
+				if (radial[key] || !source.linearEnabled || source.parameters.linearStiffness.z() <= 0.f)
+					return false;
+				radial[key] = true;
+			}
+			btTransform fa, fb;
+			calcFrame(static_cast<FrameType>(source.frameType), source.authoredFrame, bind[ia], bind[ib], fa, fb);
+			if (source.reversed)
+				links.push_back({ i, ib, ia, fb, fa, stage });
+			else
+				links.push_back({ i, ia, ib, fa, fb, stage });
+		}
+		return (links.size() == 112 || links.size() == 128) &&
+		       std::ranges::all_of(radial, [](bool present) { return present; });
 	}
 
 	RE::BSTSmartPointer<ConstraintGroup> SkyrimSystemCreator::readConstraintGroup()

@@ -345,6 +345,7 @@ void hdt::papyrus::impl::ResetPhysicsImpl(RE::Actor* actor, bool full)
 bool hdt::papyrus::impl::ReloadPhysicsFileImpl(uint32_t on_actor_formID, uint32_t on_item_formID, std::string physics_file_path, bool persist, bool verbose_log)
 {
 	const auto& AM = hdt::ActorManager::instance();
+	const bool geometry = hdt::SkyrimSystemCreator::liveProfileFamily(physics_file_path).key == "gt-geometry";
 
 	auto guard = AM->lockGuard();
 	auto& skeletons = AM->getSkeletons();
@@ -358,7 +359,7 @@ bool hdt::papyrus::impl::ReloadPhysicsFileImpl(uint32_t on_actor_formID, uint32_
 			break;
 		}
 
-		if (!skeleton.skeleton) {
+		if (!skeleton.skeleton || (geometry && hdt::isFirstPersonSkeleton(skeleton.skeleton.get()))) {
 			continue;
 		}
 
@@ -387,7 +388,12 @@ bool hdt::papyrus::impl::ReloadPhysicsFileImpl(uint32_t on_actor_formID, uint32_
 					armor_addon_found = true;
 					//Force replacing and reloading. This could lead to assess violation
 					try {
-						if (armor.physicsFile.first == std::string(physics_file_path)) {
+						bool alreadyLoaded = armor.physicsFile.first == physics_file_path;
+						if (alreadyLoaded && geometry) {
+							auto simulation = hdt::SkyrimPhysicsWorld::get()->lockSimulation();
+							alreadyLoaded = armor.hasPhysics() && armor.m_physics->liveTarget() == physics_file_path;
+						}
+						if (alreadyLoaded) {
 							if (verbose_log) {
 								RE::ConsoleLog::GetSingleton()->Print("[DynamicHDT] -- Physics file paths are identical, skipping replacing.");
 							}
@@ -419,6 +425,16 @@ bool hdt::papyrus::impl::ReloadPhysicsFileImpl(uint32_t on_actor_formID, uint32_
 
 					system = SkyrimSystemCreator().createOrUpdateSystem(skeleton.npc.get(), armor.armorWorn.get(), &armor.physicsFile, std::move(renameMap), oldSystem.get());
 
+					if (geometry && (!system || system->liveTarget() != physics_file_path)) {
+						// The requested ordinary GT rig did not attach. Preserve the previous
+						// system and path so a later controller poll can really retry.
+						armor.physicsFile.first = old_physics_file_path;
+						if (oldSystem)
+							armor.setPhysics(oldSystem, wasActive);
+						logger::warn("[ShapePhysicsLive] Could not attach complete geometry GT target {}; retained {}",
+							physics_file_path, old_physics_file_path);
+						continue;
+					}
 					if (system) {
 						system->block_resetting = true;
 
@@ -426,7 +442,9 @@ bool hdt::papyrus::impl::ReloadPhysicsFileImpl(uint32_t on_actor_formID, uint32_
 							util::transferCurrentPosesBetweenSystems(oldSystem.get(), system.get());
 						}
 
-						armor.setPhysics(system, wasActive);
+						const bool active = wasActive || (geometry && !oldSystem &&
+							skeleton.state >= hdt::ActorManager::SkeletonState::e_SkeletonActive);
+						armor.setPhysics(system, active);
 
 						system->block_resetting = false;
 					}
@@ -441,7 +459,7 @@ bool hdt::papyrus::impl::ReloadPhysicsFileImpl(uint32_t on_actor_formID, uint32_
 		}
 	}
 
-	if (persist) {
+	if (persist && (!geometry || succeeded)) {
 		auto OM = Override::OverrideManager::GetSingleton();
 		OM->registerOverride(on_actor_formID, old_physics_file_path, std::string(physics_file_path));
 	}

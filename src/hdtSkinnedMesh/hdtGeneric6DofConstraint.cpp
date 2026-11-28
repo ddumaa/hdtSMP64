@@ -1,4 +1,5 @@
 #include "hdtGeneric6DofConstraint.h"
+#include <cmath>
 
 namespace hdt
 {
@@ -18,6 +19,99 @@ namespace hdt
 		//m_oldLinearDiff.setZero();
 		//m_oldAngularDiff.setZero();
 		//m_linearBounce.setZero();
+	}
+
+	void Generic6DofConstraint::configureProgressiveZ(btScalar projectedSigma, btScalar standingLocalZ, bool distal,
+		btScalar blendWeight)
+	{
+		clearProgressiveZ();
+		if (!std::isfinite(projectedSigma) || projectedSigma <= 0 || !std::isfinite(standingLocalZ) ||
+			!std::isfinite(blendWeight) || !std::isfinite(m_linearLimitScale) || m_linearLimitScale <= 0)
+			return;
+
+		m_progressiveZ.sigma = projectedSigma / m_linearLimitScale;
+		m_progressiveZ.standing = standingLocalZ / m_linearLimitScale;
+		m_progressiveZ.rateLength = distal ? 395.f : 150.f;
+		m_progressiveZ.blendWeight = std::clamp(blendWeight, btScalar(0), btScalar(1));
+	}
+
+	void Generic6DofConstraint::clearProgressiveZ()
+	{
+		m_progressiveZ = {};
+	}
+
+	void Generic6DofConstraint::getInfo1(btConstraintInfo1* info)
+	{
+		if (progressiveZEnabled()) {
+			m_progressiveZ.lastGain = 0;
+			m_progressiveZ.lastDamping = 0;
+		}
+		btGeneric6DofSpring2Constraint::getInfo1(info);
+	}
+
+	void Generic6DofConstraint::getInfo2(btConstraintInfo2* info)
+	{
+		constexpr int axis = 2;
+		if (!progressiveZEnabled() || m_progressiveZ.blendWeight <= 0 || !m_linearLimits.m_enableSpring[axis]) {
+			btGeneric6DofSpring2Constraint::getInfo2(info);
+			return;
+		}
+
+		// getInfo1 already calculated the joint coordinates in the current Bullet frames.
+		const auto invMassA = getRigidBodyA().getInvMass();
+		const auto invMassB = getRigidBodyB().getInvMass();
+		const auto sigma = m_progressiveZ.sigma * m_linearLimitScale;
+		const auto sigmaSquared = sigma * sigma;
+		const auto standing = m_progressiveZ.standing * m_linearLimitScale;
+		const auto delta = getRelativePivotPosition(axis) - standing;
+		const auto deltaSquared = delta * delta;
+		if (invMassA <= 0 || invMassB <= 0 || !std::isfinite(sigmaSquared) || sigmaSquared <= 0 ||
+			!std::isfinite(deltaSquared) || deltaSquared <= 0 || !std::isfinite(info->fps) || info->fps <= 0) {
+			btGeneric6DofSpring2Constraint::getInfo2(info);
+			return;
+		}
+
+		constexpr btScalar onsetFraction = .33f;
+		constexpr btScalar viscosity = 625.f;
+		const auto dt = btScalar(1) / info->fps;
+		const auto invMass = invMassA + invMassB;
+		const auto weight = m_progressiveZ.blendWeight * deltaSquared /
+			(deltaSquared + onsetFraction * onsetFraction * sigmaSquared);
+		const auto gainScale = weight / (sigmaSquared * invMass);
+		const auto rate = m_progressiveZ.rateLength;
+		const auto extraStiffness = rate * rate * gainScale;
+		const auto extraDamping = viscosity * gainScale;
+
+		auto& stiffness = m_linearLimits.m_springStiffness[axis];
+		auto& damping = m_linearLimits.m_springDamping[axis];
+		auto& equilibrium = m_linearLimits.m_equilibriumPoint[axis];
+		const auto savedStiffness = stiffness;
+		const auto savedDamping = damping;
+		const auto savedEquilibrium = equilibrium;
+		const auto stiffnessCap = btScalar(1) / (16 * dt * dt * invMass);
+		const auto cappedStiffness = m_linearLimits.m_springStiffnessLimited[axis];
+		const auto baseStiffness = cappedStiffness ? btMin(savedStiffness, stiffnessCap) : savedStiffness;
+		const auto totalStiffness = cappedStiffness ? btMin(baseStiffness + extraStiffness, stiffnessCap) :
+			baseStiffness + extraStiffness;
+		const auto totalDamping = savedDamping + extraDamping;
+		const auto dampingCap = btScalar(1) / (dt * invMass);
+		const auto cappedDamping = m_linearLimits.m_springDampingLimited[axis];
+		if (!std::isfinite(totalStiffness) || !std::isfinite(totalDamping) || totalStiffness <= 0) {
+			btGeneric6DofSpring2Constraint::getInfo2(info);
+			return;
+		}
+
+		m_progressiveZ.lastGain = totalStiffness - baseStiffness;
+		m_progressiveZ.lastDamping = cappedDamping ?
+			btMin(totalDamping, dampingCap) - btMin(savedDamping, dampingCap) : extraDamping;
+		// Preserve the base force and add a spring centered on the canonical standing coordinate.
+		stiffness = totalStiffness;
+		damping = totalDamping;
+		equilibrium = (baseStiffness * savedEquilibrium + m_progressiveZ.lastGain * standing) / totalStiffness;
+		btGeneric6DofSpring2Constraint::getInfo2(info);
+		stiffness = savedStiffness;
+		damping = savedDamping;
+		equilibrium = savedEquilibrium;
 	}
 
 	void Generic6DofConstraint::scaleConstraint()
